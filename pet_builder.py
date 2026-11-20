@@ -51,6 +51,33 @@ BSETTINGS = QSettings("DesktopPetStudio", "PetBuilderSettings")
 MASK_MAX = 400   # 涂色掩膜长边上限（低分辨率足够命中判定，删除/涂色更快）
 
 
+def mask_to_b64(mask):
+    """把涂色掩膜 QImage 编码成 base64 字符串，便于随配置一起持久化。"""
+    if mask is None or mask.isNull():
+        return ''
+    try:
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QBuffer.WriteOnly)
+        mask.save(buf, 'PNG')
+        buf.close()
+        return bytes(ba.toBase64()).decode('ascii')
+    except Exception:
+        return ''
+
+
+def b64_to_mask(s):
+    """从 base64 字符串还原涂色掩膜 QImage。"""
+    if not s:
+        return None
+    try:
+        ba = QByteArray.fromBase64(s.encode('ascii'))
+        img = QImage.fromData(bytes(ba))
+        return img if not img.isNull() else None
+    except Exception:
+        return None
+
+
 def default_out_dir():
     base = HERE
     if os.path.basename(os.path.normpath(base)).lower() == 'dist':
@@ -451,8 +478,14 @@ class RegionPreview(QFrame):
             return
         img = QImage(path)
         if not img.isNull():
-            self._mask = img.convertToFormat(QImage.Format_ARGB32)
-            self.update()
+            self.set_mask_image(img)
+
+    def set_mask_image(self, img):
+        """直接从一个 QImage 恢复涂色掩膜（记忆功能用）。"""
+        if img is None or img.isNull():
+            return
+        self._mask = img.convertToFormat(QImage.Format_ARGB32)
+        self.update()
 
     def set_zones(self, regions):
         """从配置 regions 恢复区域（导入已打包桌宠时用）。"""
@@ -955,7 +988,7 @@ class Builder(QWidget):
         self._plugins_state = []   # 装饰插件列表：dict(src_dir,name,slot,anchor,scale,fps,behind)
         self._editing_plugin = False
         self._build_ui()
-        self._load_builder_settings()
+        self._load_builder_settings()   # 恢复设置 + 上次项目 + 窗口几何
 
     def qss(self):
         return """
@@ -1273,6 +1306,21 @@ class Builder(QWidget):
         self.cb_wheel.stateChanged.connect(self._on_setting_changed)
         self.cb_remember.stateChanged.connect(self._on_setting_changed)
         self.cb_autoopen.stateChanged.connect(self._on_setting_changed)
+
+        # 窗口大小 / 位置（与"记住配置"开关无关，始终恢复）
+        try:
+            ww = s.value('win_w', 0, type=int)
+            wh = s.value('win_h', 0, type=int)
+            if ww >= self.minimumWidth() and wh >= self.minimumHeight():
+                self.resize(ww, wh)
+            px = s.value('win_x', None)
+            py = s.value('win_y', None)
+            if px is not None and py is not None:
+                self.move(int(px), int(py))
+        except Exception:
+            pass
+
+        # 最后一次打开的项目（受"记住配置"开关控制）
         if self.cb_remember.isChecked():
             last = s.value('last_config', None)
             if isinstance(last, dict):
@@ -1299,6 +1347,8 @@ class Builder(QWidget):
             'double': self.cb_double.isChecked(), 'edge': self.cb_edge.isChecked(),
             'src': self.src_edit.text(), 'out': self.out_edit.text(),
             'plugins': [dict(p) for p in self._plugins_state],
+            'regions': [dict(z) for z in self.preview.zones],
+            'mask_b64': mask_to_b64(self.preview.mask_image()),
         }
 
     def _apply_last_config(self, c):
@@ -1323,17 +1373,43 @@ class Builder(QWidget):
             self.cb_edge.setChecked(bool(c.get('edge', True)))
             if c.get('out') and os.path.isdir(c['out']):
                 self.out_edit.setText(c['out'])
+
+            # 恢复"上次打开的项目"：素材源文件夹 + 装饰
+            src = c.get('src', '')
+            if src and os.path.isdir(src) and image_files(src):
+                self.src_edit.setText(src)
+                self.refresh_preview(src)   # 会 clear_zones，故区域/掩膜须在其后恢复
             plugs = c.get('plugins', [])
             if isinstance(plugs, list):
-                self._plugins_state = [dict(p) for p in plugs if isinstance(p, dict) and p.get('src_dir')]
+                self._plugins_state = [dict(p) for p in plugs
+                                       if isinstance(p, dict) and p.get('src_dir')
+                                       and os.path.isdir(p['src_dir'])]
             self.refresh_plugin_list()
+
+            # 区域 + 涂色掩膜（必须在 refresh_preview 之后）
+            regions = c.get('regions', [])
+            if isinstance(regions, list) and regions:
+                self.preview.set_zones(regions)
+            mimg = b64_to_mask(c.get('mask_b64', ''))
+            if mimg is not None:
+                self.preview.set_mask_image(mimg)
+            self.refresh_zone_combo()
             self._sync_preview_decos()
         except Exception:
             pass
 
     def closeEvent(self, e):
+        # 窗口大小 / 位置始终记忆（与"记住配置"开关无关）
+        try:
+            BSETTINGS.setValue('win_w', self.width())
+            BSETTINGS.setValue('win_h', self.height())
+            BSETTINGS.setValue('win_x', self.x())
+            BSETTINGS.setValue('win_y', self.y())
+        except Exception:
+            pass
         if self.cb_remember.isChecked():
-            BSETTINGS.setValue('last_config', self._collect_config()); BSETTINGS.sync()
+            BSETTINGS.setValue('last_config', self._collect_config())
+        BSETTINGS.sync()
         super().closeEvent(e)
 
     # ---------- 交互 ----------
