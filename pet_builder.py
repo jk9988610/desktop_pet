@@ -1285,18 +1285,25 @@ class Builder(QWidget):
 
         rv.addStretch()
         inner.setLayout(rv); right.setWidget(inner)
-        splitter.addWidget(right); splitter.setSizes([716, 480])  # 预览区优先：左栏约 60%，右栏保证配置不被裁切
+
+        # 右栏容器：上=配置滚动区，底=按钮/进度/日志固定区（不随配置滚动）
+        right_host = QWidget()
+        rh = QVBoxLayout(right_host)
+        rh.setContentsMargins(0, 0, 0, 0); rh.setSpacing(8)
+        rh.addWidget(right, 1)
 
         actrow = QHBoxLayout()
         self.build_btn = QPushButton("开始打包桌宠"); self.build_btn.setObjectName('primary')
         self.build_btn.clicked.connect(self.start_build)
         self.open_btn = QPushButton("打开输出文件夹"); self.open_btn.clicked.connect(self.open_out)
         actrow.addWidget(self.build_btn, 2); actrow.addWidget(self.open_btn, 1)
-        root.addLayout(actrow)
-        self.progress = QProgressBar(); self.progress.setValue(0); root.addWidget(self.progress)
-        self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setFixedHeight(78)
+        rh.addLayout(actrow)
+        self.progress = QProgressBar(); self.progress.setValue(0); rh.addWidget(self.progress)
+        self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setFixedHeight(84)
         self.log.setStyleSheet("background:#111318;color:#9aa0aa;border:1px solid #2a2e38;border-radius:6px;font:11px Consolas;")
-        root.addWidget(self.log)
+        rh.addWidget(self.log)
+
+        splitter.addWidget(right_host); splitter.setSizes([716, 480])  # 预览区优先：左栏约 60%，右栏保证配置不被裁切
 
     # ---------- 生成器设置持久化 ----------
     def _load_builder_settings(self):
