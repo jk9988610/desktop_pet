@@ -140,6 +140,19 @@ def safe_name(name):
     return re.sub(r'[\\/:*?"<>|]+', '_', name).strip() or "桌宠"
 
 
+def write_bytes_if_changed(path, data):
+    """内容一致时不写盘，避免更新 mtime 破坏 PyInstaller 的 Analysis 缓存复用（快速增量模式依赖此特性）。"""
+    try:
+        with open(path, 'rb') as f:
+            if f.read() == data:
+                return False
+    except OSError:
+        pass
+    with open(path, 'wb') as f:
+        f.write(data)
+    return True
+
+
 def free_target_exe(exe_path, exe_name, log):
     if not os.path.exists(exe_path):
         return True
@@ -204,9 +217,10 @@ class BuildWorker(QThread):
     done = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, opts):
+    def __init__(self, opts, fast=False):
         super().__init__()
         self.opts = opts
+        self.fast = bool(fast)
 
     def emit_log(self, s):
         self.log.emit(str(s))
@@ -214,7 +228,13 @@ class BuildWorker(QThread):
     def run(self):
         o = self.opts
         try:
-            work = os.path.join(HERE, '_build', safe_name(o['name']) + '_' + str(int(time.time())))
+            sname = safe_name(o['name'])
+            if self.fast:
+                # 快速增量：工作目录按名字固定，保留 Analysis/PYZ 缓存供下次复用。
+                # 单文件模式仍用时间戳目录，避免残留缓存干扰每次的干净构建。
+                work = os.path.join(HERE, '_build', 'cache', sname)
+            else:
+                work = os.path.join(HERE, '_build', sname + '_' + str(int(time.time())))
             assets = os.path.join(work, 'assets')
             os.makedirs(assets, exist_ok=True)
 
@@ -225,6 +245,7 @@ class BuildWorker(QThread):
             self.progress.emit(5)
 
             ratio = None
+            kept_frames = set()
             for i, src in enumerate(files):
                 img = QImage(src)
                 if img.isNull():
@@ -237,16 +258,36 @@ class BuildWorker(QThread):
                     scaled = img.scaled(w, o['target_h'], Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
                 else:
                     scaled = img
-                scaled.save(os.path.join(assets, 'frame_%04d.webp' % i), 'WEBP', o['quality'])
+                frame_path = os.path.join(assets, 'frame_%04d.webp' % i)
+                ba = QByteArray(); buf = QBuffer(ba)
+                buf.open(QBuffer.WriteOnly)
+                scaled.save(buf, 'WEBP', o['quality'])
+                buf.close()
+                write_bytes_if_changed(frame_path, bytes(ba.data()))
+                kept_frames.add('frame_%04d.webp' % i)
                 if (i + 1) % 10 == 0 or i == len(files) - 1:
                     self.emit_log("  已处理 %d/%d" % (i + 1, len(files)))
                     self.progress.emit(5 + int(35 * (i + 1) / len(files)))
 
+            # 快速模式复用目录：删除本次不再需要的旧帧/旧掩膜，避免帧数减少时残留
+            if self.fast:
+                for old in os.listdir(assets):
+                    if old not in kept_frames:
+                        try:
+                            os.remove(os.path.join(assets, old))
+                        except Exception:
+                            pass
+
             mask_obj = o.get('mask_image')
             if mask_obj is not None and not mask_obj.isNull() and o.get('has_paint'):
-                mask_obj.save(os.path.join(assets, 'paint_mask.png'), 'PNG')
+                ba = QByteArray(); buf = QBuffer(ba)
+                buf.open(QBuffer.WriteOnly)
+                mask_obj.save(buf, 'PNG')
+                buf.close()
+                write_bytes_if_changed(os.path.join(assets, 'paint_mask.png'), bytes(ba.data()))
 
-            shutil.copy2(os.path.join(template_dir(), 'pet.py'), os.path.join(work, 'pet.py'))
+            with open(os.path.join(template_dir(), 'pet.py'), 'rb') as pf:
+                write_bytes_if_changed(os.path.join(work, 'pet.py'), pf.read())
             cfg = {
                 "name": o['name'], "frame_count": len(files),
                 "default_height": o['height'], "default_fps": o['fps'],
@@ -258,13 +299,17 @@ class BuildWorker(QThread):
                 "regions": o['regions'], "hit_mode": o['hit_mode'],
                 "region_drag_block": o['region_drag_block'], "drag_threshold": o['drag_threshold'],
             }
-            with open(os.path.join(work, 'config.json'), 'w', encoding='utf-8') as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            write_bytes_if_changed(os.path.join(work, 'config.json'),
+                                   json.dumps(cfg, ensure_ascii=False, indent=2).encode('utf-8'))
 
-            # 装饰插件：把每个插件文件夹压缩为 zip，输出到 exe 同目录的 plugins/
+            # 装饰插件：把每个插件文件夹压缩为 zip，输出到 exe 同目录的 plugins/。
+            # 快速增量(onedir)的 exe 在「输出目录/名字/」内，插件要放进同一层。
             plugins = o.get('plugins', [])
             if plugins:
-                plug_out = os.path.join(o['out_dir'], 'plugins')
+                if self.fast:
+                    plug_out = os.path.join(o['out_dir'], sname, 'plugins')
+                else:
+                    plug_out = os.path.join(o['out_dir'], 'plugins')
                 os.makedirs(plug_out, exist_ok=True)
                 for idx, plug in enumerate(plugins):
                     if not plug.get('src_dir') or not os.path.isdir(plug['src_dir']):
@@ -299,23 +344,39 @@ class BuildWorker(QThread):
                     self.emit_log("  装饰插件已打包: %s (%d 帧)" % (os.path.basename(zip_path), len(pfiles)))
                 self.emit_log("装饰插件输出到: " + plug_out)
 
-            self.emit_log("资源处理完成，开始打包 exe（约需 30-90 秒）...")
-            self.progress.emit(42)
-
             os.makedirs(o['out_dir'], exist_ok=True)
-            target_exe = os.path.join(o['out_dir'], safe_name(o['name']) + '.exe')
-            free_target_exe(target_exe, safe_name(o['name']) + '.exe', self.emit_log)
             sep = os.pathsep
-            cmd = [
-                find_python(), '-m', 'PyInstaller', '--noconfirm', '--onefile', '--windowed', '--clean',
-                '--name', safe_name(o['name']),
-                '--add-data', 'assets' + sep + 'assets',
-                '--add-data', 'config.json' + sep + '.',
-                '--distpath', o['out_dir'],
-                '--workpath', os.path.join(work, 'work'),
-                '--specpath', work,
-                'pet.py',
-            ]
+            if self.fast:
+                # 快速增量：onedir + 保留缓存。产物是「输出目录/名字/」文件夹。
+                # 不清 --clean，PyInstaller 复用 workpath 里的 Analysis/PYZ。
+                self.emit_log("快速增量模式：复用缓存打包（首次约需 1 分钟，之后仅数秒）...")
+                target_exe = os.path.join(o['out_dir'], sname, sname + '.exe')
+                free_target_exe(target_exe, sname + '.exe', self.emit_log)
+                cmd = [
+                    find_python(), '-m', 'PyInstaller', '--noconfirm', '--onedir', '--windowed',
+                    '--name', sname,
+                    '--add-data', 'assets' + sep + 'assets',
+                    '--add-data', 'config.json' + sep + '.',
+                    '--distpath', o['out_dir'],
+                    '--workpath', os.path.join(work, 'work'),
+                    '--specpath', work,
+                    'pet.py',
+                ]
+            else:
+                self.emit_log("单文件模式：开始打包（约需 30-90 秒）...")
+                target_exe = os.path.join(o['out_dir'], sname + '.exe')
+                free_target_exe(target_exe, sname + '.exe', self.emit_log)
+                cmd = [
+                    find_python(), '-m', 'PyInstaller', '--noconfirm', '--onefile', '--windowed', '--clean',
+                    '--name', sname,
+                    '--add-data', 'assets' + sep + 'assets',
+                    '--add-data', 'config.json' + sep + '.',
+                    '--distpath', o['out_dir'],
+                    '--workpath', os.path.join(work, 'work'),
+                    '--specpath', work,
+                    'pet.py',
+                ]
+            self.progress.emit(42)
             self.emit_log("打包命令已启动")
             env = os.environ.copy()
             env['PYTHONIOENCODING'] = 'utf-8'; env['PYTHONUTF8'] = '1'
@@ -332,9 +393,9 @@ class BuildWorker(QThread):
             if proc.wait() != 0:
                 raise RuntimeError("PyInstaller 打包失败")
 
-            exe = os.path.join(o['out_dir'], safe_name(o['name']) + '.exe')
+            exe = target_exe
             if not os.path.exists(exe):
-                raise RuntimeError("未找到生成的 exe 文件")
+                raise RuntimeError("未找到生成的 exe 文件（%s）" % exe)
             self.progress.emit(100)
             self.emit_log("完成！输出: " + exe)
             self.done.emit(exe)
@@ -1367,6 +1428,13 @@ class Builder(QWidget):
 
         g_set = QGroupBox("⑨ 生成器设置")
         fset = QFormLayout(g_set)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("单文件 exe（便于分发）", "onefile")
+        self.mode_combo.addItem("文件夹·快速增量（反复修改角色时更快）", "onedir")
+        self.mode_combo.setToolTip(
+            "单文件：生成一个独立 exe，方便分发，每次全量打包约 60-90 秒。\n"
+            "文件夹·快速增量：生成文件夹，保留构建缓存；首次约 1 分钟，之后改角色仅数秒。")
+        fset.addRow("打包模式", self.mode_combo)
         self.cb_wheel = QCheckBox("允许滚轮调节数值框（默认关闭；开启后滚轮经过数字框才改值）")
         fset.addRow(self.cb_wheel)
         self.cb_remember = QCheckBox("记住上次配置（下次打开自动载入）"); self.cb_remember.setChecked(True)
@@ -1412,9 +1480,13 @@ class Builder(QWidget):
         self.cb_wheel.setChecked(wheel); WheelSpinBox.WHEEL_ENABLED = wheel
         self.cb_remember.setChecked(s.value('remember', True, type=bool))
         self.cb_autoopen.setChecked(s.value('autoopen', True, type=bool))
+        build_mode = s.value('build_mode', 'onefile')
+        idx = self.mode_combo.findData(build_mode)
+        self.mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.cb_wheel.stateChanged.connect(self._on_setting_changed)
         self.cb_remember.stateChanged.connect(self._on_setting_changed)
         self.cb_autoopen.stateChanged.connect(self._on_setting_changed)
+        self.mode_combo.currentIndexChanged.connect(self._on_setting_changed)
 
         # 窗口大小 / 位置（与"记住配置"开关无关，始终恢复）
         try:
@@ -1441,6 +1513,7 @@ class Builder(QWidget):
         s.setValue('wheel_spin', self.cb_wheel.isChecked())
         s.setValue('remember', self.cb_remember.isChecked())
         s.setValue('autoopen', self.cb_autoopen.isChecked())
+        s.setValue('build_mode', self.mode_combo.currentData())
         s.sync()
 
     def _collect_config(self):
@@ -1940,7 +2013,9 @@ class Builder(QWidget):
         )
         self.build_btn.setEnabled(False)
         self.progress.setValue(0); self.log.clear()
-        self.worker = BuildWorker(opts)
+        fast = (self.mode_combo.currentData() == 'onedir')
+        self._last_fast = fast
+        self.worker = BuildWorker(opts, fast=fast)
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.progress.setValue)
         self.worker.done.connect(self.on_done)
@@ -1951,7 +2026,13 @@ class Builder(QWidget):
         self.build_btn.setEnabled(True); self.progress.setValue(100)
         if self.cb_remember.isChecked():
             BSETTINGS.setValue('last_config', self._collect_config()); BSETTINGS.sync()
-        QMessageBox.information(self, "打包完成", "桌宠已生成：\n" + exe + "\n\n双击即可运行。")
+        if getattr(self, '_last_fast', False):
+            hint = ("文件夹·快速增量模式：桌宠已生成在下方文件夹。\n" + os.path.dirname(exe) +
+                    "\n\n请运行其中的「" + os.path.basename(exe) + "」。\n"
+                    "注意：文件夹需整体保留，不要单独移动 exe。")
+        else:
+            hint = "桌宠已生成：\n" + exe + "\n\n双击即可运行。"
+        QMessageBox.information(self, "打包完成", hint)
         if self.cb_autoopen.isChecked():
             try:
                 os.startfile(os.path.dirname(exe))
