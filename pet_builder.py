@@ -1138,10 +1138,12 @@ class Builder(QWidget):
         g2 = QGroupBox("③ 基本信息")
         form = QFormLayout(g2)
         self.name_edit = QLineEdit("我的桌宠")
-        form.addRow("桌宠名称\n（默认取文件夹名，可修改；也是 exe 文件名）", self.name_edit)
+        self.name_edit.setToolTip("默认取文件夹名，可修改；也是生成的 exe 文件名")
+        form.addRow("桌宠名称", self.name_edit)
         self.speech_edit = QTextEdit(); self.speech_edit.setFixedHeight(88)
         self.speech_edit.setPlainText(DEFAULT_SPEECH)
-        form.addRow("整体台词\n（点击空白处随机说一句）", self.speech_edit)
+        self.speech_edit.setToolTip("点击桌宠空白处时随机说一句（每行一句）")
+        form.addRow("整体台词", self.speech_edit)
         rv.addWidget(g2)
 
         g_click = QGroupBox("④ 点击表现")
@@ -1252,14 +1254,14 @@ class Builder(QWidget):
         fl.addRow("播放帧率(fps)", self.fps)
         fl.addRow("资源清晰度", self.target_h)
         fl.addRow("图片质量(%)", self.quality)
-        brow = QHBoxLayout()
         self.bt = QLineEdit("#ffe9ea"); self.bbg = QLineEdit("rgba(32,26,30,216)")
         self.bbd = QLineEdit("rgba(230,90,90,180)")
         self.fs = WheelSpinBox(); self.fs.setRange(9, 28); self.fs.setValue(13)
-        for ed in (self.bt, self.bbg, self.bbd):
+        for label, ed in (("气泡文字色", self.bt), ("气泡背景色", self.bbg), ("气泡边框色", self.bbd)):
             btn = QPushButton("取色"); btn.clicked.connect(lambda _, e=ed: self.pick_color(e))
-            h = QHBoxLayout(); h.addWidget(ed, 1); h.addWidget(btn); brow.addLayout(h)
-        fl.addRow("气泡文字 / 背景 / 边框（CSS）", brow)
+            h = QHBoxLayout(); h.setContentsMargins(0, 0, 0, 0)
+            h.addWidget(ed, 1); h.addWidget(btn)
+            fl.addRow(label, h)
         fl.addRow("气泡字号", self.fs)
         rv.addWidget(g_look)
 
@@ -1283,7 +1285,7 @@ class Builder(QWidget):
 
         rv.addStretch()
         inner.setLayout(rv); right.setWidget(inner)
-        splitter.addWidget(right); splitter.setSizes([430, 760])
+        splitter.addWidget(right); splitter.setSizes([716, 480])  # 预览区优先：左栏约 60%，右栏保证配置不被裁切
 
         actrow = QHBoxLayout()
         self.build_btn = QPushButton("开始打包桌宠"); self.build_btn.setObjectName('primary')
