@@ -353,6 +353,7 @@ class RegionPreview(QFrame):
     zoneClicked = Signal(int)
     zonesChanged = Signal()
     decoChanged = Signal(int)   # 预览里拖动/缩放某装饰后通知写回配置（插件索引）
+    historyChanged = Signal()   # 撤销/重做栈变化（用于刷新按钮可用状态）
 
     def __init__(self):
         super().__init__()
@@ -362,10 +363,15 @@ class RegionPreview(QFrame):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMouseTracking(True)
         self.setContextMenuPolicy(Qt.PreventContextMenu)
+        self.setFocusPolicy(Qt.StrongFocus)   # 让 Ctrl+Z / Ctrl+Y 能落到预览上
         self._pm = QPixmap()
         self._mask = QImage()
         self.zones = []
         self.selected = -1
+        # 撤销/重做：zones + 涂色掩膜 + 选中项的历史快照
+        self._undo_stack = []
+        self._redo_stack = []
+        self._history_limit = 60
         self.mode = 'rect'
         self.brush_color = PALETTE[0][0]
         self.brush_size = 18
@@ -459,6 +465,7 @@ class RegionPreview(QFrame):
                 mw = MASK_MAX; mh = max(1, int(MASK_MAX * ph / pw))
             self._mask = QImage(mw, mh, QImage.Format_ARGB32)
             self._mask.fill(QColor(0, 0, 0, 0))
+        self.reset_history()   # 换素材 = 新工程，历史作废
         self.reset_view()
 
     def clear_zones(self):
@@ -466,6 +473,7 @@ class RegionPreview(QFrame):
         self.selected = -1
         if not self._mask.isNull():
             self._mask.fill(QColor(0, 0, 0, 0))
+        self.reset_history()
         self.zonesChanged.emit()
         self.update()
 
@@ -504,10 +512,64 @@ class RegionPreview(QFrame):
             })
         self.zones = zones
         self.selected = -1
+        self.reset_history()
         self.update()
 
     def has_paint(self):
         return any(z.get('type') == 'paint' for z in self.zones)
+
+    # ---- 撤销 / 重做（框选、涂色、删除）----
+    def _snapshot(self):
+        return {
+            'zones': [{k: (list(v) if isinstance(v, list) else v) for k, v in z.items()}
+                      for z in self.zones],
+            'mask': self._mask.copy() if not self._mask.isNull() else QImage(),
+            'selected': self.selected,
+        }
+
+    def _restore_snapshot(self, snap):
+        self.zones = [{k: (list(v) if isinstance(v, list) else v) for k, v in z.items()}
+                      for z in snap.get('zones', [])]
+        m = snap.get('mask')
+        self._mask = m.copy() if (m is not None and not m.isNull()) else QImage()
+        self.selected = snap.get('selected', -1)
+        self._drag_start = None
+        self._drag_cur = None
+        self.zonesChanged.emit()
+        self.update()
+
+    def push_history(self):
+        """在会改变 zones/mask 的操作之前调用，记录当前状态。"""
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > self._history_limit:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self.historyChanged.emit()
+
+    def reset_history(self):
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.historyChanged.emit()
+
+    def can_undo(self):
+        return bool(self._undo_stack)
+
+    def can_redo(self):
+        return bool(self._redo_stack)
+
+    def undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        self._restore_snapshot(self._undo_stack.pop())
+        self.historyChanged.emit()
+
+    def redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        self._restore_snapshot(self._redo_stack.pop())
+        self.historyChanged.emit()
 
     def reset_view(self):
         self.zoom = 1.0
@@ -711,7 +773,10 @@ class RegionPreview(QFrame):
         if not px or self._mask.isNull():
             return
         painter = QPainter(self._mask)
-        painter.setRenderHint(QPainter.Antialiasing)
+        # 涂色掩膜本质是「索引图」：每个有效像素必须精确等于某个调色板色（alpha=255）。
+        # 关闭抗锯齿，避免边缘像素的 RGB 因预乘/混合产生偏差；用 Source 合成直接覆盖，
+        # 避免与已有颜色叠加出「第三种颜色」。否则删除时按精确 RGB 匹配会留下彩色残粒。
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
         pen = QPen(QColor(self.brush_color), self._brush_mask_px() * 2,
                    Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         painter.setPen(pen)
@@ -731,12 +796,22 @@ class RegionPreview(QFrame):
         want = QColor(color_hex)
         w, h = self._mask.width(), self._mask.height()
         wr, wg, wb = want.red(), want.green(), want.blue()
+        # 容忍旧版本抗锯齿/叠加造成的偏差像素：逐通道误差累计小于阈值即视为同色。
+        # 调色板任意两色的曼哈顿距离最小约 90，阈值 45 不会误删相邻颜色。
+        tol = 45
+        changed = False
         for y in range(h):
             for x in range(w):
                 c = self._mask.pixelColor(x, y)
-                if c.alpha() > 0 and (c.red(), c.green(), c.blue()) == (wr, wg, wb):
+                if c.alpha() <= 0:
+                    continue
+                # 极低 alpha 的半透明边（命中判定本就忽略）也一并清掉，避免视觉残粒
+                near = (abs(c.red() - wr) + abs(c.green() - wg) + abs(c.blue() - wb)) <= tol
+                if near or c.alpha() < 40:
                     self._mask.setPixelColor(x, y, QColor(0, 0, 0, 0))
-        self.update()
+                    changed = True
+        if changed:
+            self.update()
 
     def _hit_zone(self, pt):
         n = self._to_norm(pt)
@@ -795,6 +870,8 @@ class RegionPreview(QFrame):
             self._drag_start = e.position().toPoint()
             self._drag_cur = e.position().toPoint()
         else:
+            # 一次落笔 = 一条历史记录（在改动 zones/mask 之前压栈）
+            self.push_history()
             self._drag_start = e.position().toPoint()
             self._drag_cur = e.position().toPoint()
             idx = self._color_zone(self.brush_color)
@@ -860,6 +937,17 @@ class RegionPreview(QFrame):
         self._drag_cur = None
         self.update()
 
+    def keyPressEvent(self, e):
+        # Ctrl+Z 撤销 / Ctrl+Y 重做（Ctrl+Shift+Z 亦可重做）
+        if e.modifiers() & Qt.ControlModifier:
+            k = e.key()
+            shift = bool(e.modifiers() & Qt.ShiftModifier)
+            if k == Qt.Key_Z and not shift:
+                self.undo(); e.accept(); return
+            if k == Qt.Key_Y or (k == Qt.Key_Z and shift):
+                self.redo(); e.accept(); return
+        super().keyPressEvent(e)
+
     def wheelEvent(self, e):
         delta = e.angleDelta().y()
         if not delta:
@@ -914,6 +1002,7 @@ class RegionPreview(QFrame):
         return -1
 
     def _new_rect_zone(self, x0, y0, x1, y1):
+        self.push_history()
         self.zones.append({
             "name": "区域%d" % (len(self.zones) + 1), "type": "rect",
             "rect": [round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4)],
@@ -935,6 +1024,7 @@ class RegionPreview(QFrame):
 
     def delete_zone(self, idx):
         if 0 <= idx < len(self.zones):
+            self.push_history()
             z = self.zones[idx]
             if z.get('type') == 'paint' and z.get('color'):
                 self._erase_color(z['color'])
@@ -1079,7 +1169,17 @@ class Builder(QWidget):
         btn_rst_layer = QPushButton("重置图层"); btn_rst_layer.setObjectName('tool')
         btn_rst_layer.setToolTip("把角色和装饰的拖动/缩放复位")
         btn_rst_layer.clicked.connect(self.preview.reset_layers)
-        tools.addWidget(btn_rst_layer); tools.addStretch(1)
+        tools.addWidget(btn_rst_layer)
+        self.btn_undo = QPushButton("↶ 撤销"); self.btn_undo.setObjectName('tool')
+        self.btn_undo.setToolTip("撤销上一步框选/涂色/删除 (Ctrl+Z)")
+        self.btn_undo.clicked.connect(self.preview.undo)
+        self.btn_redo = QPushButton("↷ 重做"); self.btn_redo.setObjectName('tool')
+        self.btn_redo.setToolTip("重做上一步撤销 (Ctrl+Y)")
+        self.btn_redo.clicked.connect(self.preview.redo)
+        self.preview.historyChanged.connect(self._update_history_buttons)
+        tools.addWidget(self.btn_undo); tools.addWidget(self.btn_redo)
+        tools.addStretch(1)
+        self._update_history_buttons()
         lp.addLayout(tools)
 
         # 播放 / 显示开关（针对预览）
@@ -1122,8 +1222,8 @@ class Builder(QWidget):
         self.paint_tools.setVisible(False)
         lp.addWidget(self.paint_tools)
 
-        tip = QLabel("Ctrl+滚轮：单独缩放鼠标下的角色/装饰 · Ctrl+左键拖动：移动角色/装饰（装饰位置会写回插件配置）\n"
-                     "滚轮：整体缩放 · 中键/右键拖动：平移 · 普通左键：框选/涂色")
+        tip = QLabel("Ctrl+Z：撤销框选/涂色/删除 · Ctrl+Y：重做（也可点上方工具栏按钮）\n"
+                     "Ctrl+滚轮：单独缩放角色/装饰 · Ctrl+左键拖动：移动角色/装饰 · 滚轮：缩放 · 中键/右键拖动：平移")
         tip.setObjectName('hint'); tip.setWordWrap(True)
         lp.addWidget(tip)
         lp.addWidget(self.preview, 1)
@@ -1422,6 +1522,22 @@ class Builder(QWidget):
         super().closeEvent(e)
 
     # ---------- 交互 ----------
+    def _update_history_buttons(self):
+        self.btn_undo.setEnabled(self.preview.can_undo())
+        self.btn_redo.setEnabled(self.preview.can_redo())
+
+    def keyPressEvent(self, e):
+        # 焦点在按钮/窗口等非文本控件时，Ctrl+Z / Ctrl+Y 也作用于区域编辑。
+        # 文本框/编辑器会自行处理并消费该按键（保留原生文字撤销），不会传播到这里。
+        if e.modifiers() & Qt.ControlModifier:
+            k = e.key()
+            shift = bool(e.modifiers() & Qt.ShiftModifier)
+            if k == Qt.Key_Z and not shift:
+                self.preview.undo(); e.accept(); return
+            if k == Qt.Key_Y or (k == Qt.Key_Z and shift):
+                self.preview.redo(); e.accept(); return
+        super().keyPressEvent(e)
+
     def set_mode(self, mode):
         self.preview.mode = mode
         self.mode_rect.setChecked(mode == 'rect')
