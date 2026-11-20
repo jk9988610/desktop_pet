@@ -40,6 +40,8 @@ desktop.ini
 #   assets/frame_*.webp  —— 示例序列帧（桌宠运行必需）
 #   assets/paint_mask.png —— 示例涂色蒙版（paint 区域命中必需）
 #   config.json          —— 示例配置
-#   pet.py / pet_builder.py / prepare_assets.py —— 源码
+#   pet.py / pet_builder.py / pet_extract.py —— 源码
+#   sample/*.png         —— 原始序列帧（画质最好的素材源，供重新打包用）
+#   script/              —— 装饰插件源素材（脚底光效等）
 #   *.bat                —— 启动脚本
 # ------------------------------------------------------------

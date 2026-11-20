@@ -15,11 +15,13 @@ v2 区域模型（regions）：
 import os
 import sys
 import json
+import glob
 import random
 import hashlib
+import zipfile
 
 from PySide6.QtCore import (
-    Qt, QTimer, QPoint, QPropertyAnimation, QEasingCurve, QSettings,
+    Qt, QTimer, QPoint, QSize, QRect, QPropertyAnimation, QEasingCurve, QSettings,
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QColor, QCursor, QPainter, QFont, QFontMetrics, QGuiApplication, QIcon,
@@ -190,6 +192,90 @@ def mask_file():
     return resource_path(os.path.join("assets", "paint_mask.png"))
 
 
+# ---------- 装饰插件（衣柜） ----------
+# 槽位：锚点是"装饰图片中心"相对角色矩形(0~1)的位置；behind 表示画在角色下面
+SLOTS = {
+    "feet":  {"label": "脚底",   "anchor": [0.50, 0.94], "scale": 1.30, "behind": True},
+    "head":  {"label": "头顶",   "anchor": [0.50, 0.04], "scale": 0.55, "behind": False},
+    "back":  {"label": "身后",   "anchor": [0.50, 0.55], "scale": 1.10, "behind": True},
+    "front": {"label": "身前",   "anchor": [0.50, 0.60], "scale": 0.60, "behind": False},
+}
+SLOT_ORDER = ["feet", "head", "back", "front"]
+
+
+def plugins_dir():
+    """插件目录固定在 exe / 脚本所在目录旁边的 plugins 文件夹（与资源解包目录无关）。"""
+    base = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) \
+        else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "plugins")
+
+
+def load_plugins():
+    """扫描 plugins/*.zip，返回插件列表。每个 zip 内：meta.json + 若干帧图片。"""
+    out = []
+    root = plugins_dir()
+    if not os.path.isdir(root):
+        return out
+    exts = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')
+    for zp in sorted(glob.glob(os.path.join(root, '*.zip'))):
+        try:
+            with zipfile.ZipFile(zp, 'r') as z:
+                names = z.namelist()
+                meta = {}
+                if 'meta.json' in names:
+                    try:
+                        meta = json.loads(z.read('meta.json').decode('utf-8'))
+                    except Exception:
+                        meta = {}
+                frames = sorted(
+                    [n for n in names if n.lower().endswith(exts) and not n.startswith('__')],
+                    key=natural_sort_key,
+                )
+                if not frames:
+                    continue
+                slot = str(meta.get('slot', 'feet'))
+                if slot not in SLOTS:
+                    slot = 'feet'
+                anchor = meta.get('anchor', SLOTS[slot]['anchor'])
+                if not (isinstance(anchor, list) and len(anchor) == 2):
+                    anchor = SLOTS[slot]['anchor']
+                try:
+                    anchor = [max(0.0, min(1.0, float(anchor[0]))),
+                              max(0.0, min(1.0, float(anchor[1])))]
+                except Exception:
+                    anchor = list(SLOTS[slot]['anchor'])
+                try:
+                    scale = max(0.05, min(6.0, float(meta.get('scale', SLOTS[slot]['scale']))))
+                except Exception:
+                    scale = SLOTS[slot]['scale']
+                try:
+                    fps = max(1, min(60, int(meta.get('fps', 12))))
+                except Exception:
+                    fps = 12
+                behind = meta.get('behind', SLOTS[slot]['behind'])
+                behind = _to_bool(behind, SLOTS[slot]['behind'])
+                images = []
+                for n in frames:
+                    im = QImage.fromData(z.read(n))
+                    if not im.isNull():
+                        images.append(im.convertToFormat(QImage.Format_ARGB32))
+                if not images:
+                    continue
+                out.append({
+                    'id': os.path.basename(zp),
+                    'name': str(meta.get('name', os.path.splitext(os.path.basename(zp))[0])),
+                    'slot': slot, 'anchor': anchor, 'scale': scale, 'fps': fps,
+                    'behind': behind, 'images': images,
+                })
+        except Exception:
+            continue
+    return out
+
+
+def natural_sort_key(s):
+    return [int(t) if t.isdigit() else t.lower() for t in __import__('re').split(r'(\d+)', s)]
+
+
 class Bubble(QLabel):
     def __init__(self):
         super().__init__(None)
@@ -229,10 +315,11 @@ class Bubble(QLabel):
         if not self._owner:
             return
         ow = self._owner
-        x = ow.x() + (ow.width() - self.width()) // 2
-        y = ow.y() - self.height() - 6
+        cr = ow._char_rect()
+        x = ow.x() + cr.left() + (cr.width() - self.width()) // 2
+        y = ow.y() + cr.top() - self.height() - 6
         if y < 4:
-            y = ow.y() + ow.height() + 6
+            y = ow.y() + cr.top() + cr.height() + 6
         screen = QGuiApplication.primaryScreen().availableGeometry()
         x = max(screen.left() + 4, min(x, screen.right() - self.width() - 4))
         self.move(x, y)
@@ -260,6 +347,16 @@ class Pet(QWidget):
         self.cache = {}
         self._alpha_cache = {}
         self.warm_i = 0
+
+        # 装饰插件：所有可用插件 + 每个槽位当前选择（QSettings 记忆）
+        self.plugins = load_plugins()
+        self.deco_sel = {}
+        for s in SLOT_ORDER:
+            v = self.settings.value("deco_" + s, "")
+            self.deco_sel[s] = v if any(p['id'] == v for p in self.plugins) else ""
+        self._deco_state = {}   # id -> {'frame':int, 'acc':float}
+        self._deco_cache = {}   # (id, frame, w, h) -> QPixmap
+
         self._drag_pos = None
         self._press_global = None
         self._press_zone_no_drag = False
@@ -307,10 +404,23 @@ class Pet(QWidget):
         self._setup_tray()
 
     # ---------- 尺寸 / 缓存 ----------
+    # 画布比角色矩形四周各扩 PAD 比例，让脚底/头顶装饰能画到角色边界之外。
+    PAD = 0.34
+
+    def _char_rect(self):
+        """角色本体在窗口中的矩形（含四周内边距）。"""
+        cw = max(1, int(round(self.pet_height * self.ratio)))
+        px = int(round(cw * self.PAD))
+        py = int(round(self.pet_height * self.PAD))
+        return QRect(px, py, cw, self.pet_height)
+
     def _apply_size(self):
-        w = max(1, int(self.pet_height * self.ratio))
-        self.resize(w, self.pet_height)
+        cr = self._char_rect()
+        w = cr.width() + cr.left() * 2
+        h = self.pet_height + cr.top() * 2
+        self.resize(w, h)
         self.cache.clear()
+        self._deco_cache.clear()
         self.warm_i = 0
 
     def pixmap(self, i):
@@ -318,7 +428,8 @@ class Pet(QWidget):
         if i not in self.cache:
             src = QPixmap(frame_file(i))
             if not src.isNull():
-                self.cache[i] = src.scaled(self.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+                cr = self._char_rect()
+                self.cache[i] = src.scaled(cr.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
             else:
                 self.cache[i] = QPixmap()
         return self.cache[i]
@@ -341,16 +452,78 @@ class Pet(QWidget):
         self.warm_i += 1
 
     def _tick(self):
+        dt = max(10, int(1000 / max(1, self.fps)))
+        # 装饰按各自 fps 独立推进帧（不随角色暂停，装饰常亮更像特效）
+        for plug in self.plugins:
+            if plug['id'] not in self.deco_sel.values():
+                continue
+            st = self._deco_state.setdefault(plug['id'], {'frame': 0, 'acc': 0.0})
+            st['acc'] += dt
+            interval = 1000.0 / plug['fps']
+            adv = int(st['acc'] // interval)
+            if adv > 0:
+                st['acc'] -= adv * interval
+                st['frame'] = (st['frame'] + adv) % max(1, len(plug['images']))
+                self.update()
         if self.playing:
             self.frame = (self.frame + 1) % FRAME_COUNT
             self.update()
 
+    def _active_decos(self, behind):
+        """当前每个槽位选中的装饰，按 behind 过滤。"""
+        out = []
+        for s in SLOT_ORDER:
+            pid = self.deco_sel.get(s, "")
+            if not pid:
+                continue
+            for plug in self.plugins:
+                if plug['id'] == pid and plug['behind'] == behind:
+                    out.append(plug)
+                    break
+        return out
+
+    def _deco_pixmap(self, plug, frame):
+        """把装饰某一帧缩放成目标尺寸（带缓存）。"""
+        ims = plug['images']
+        if not ims:
+            return QPixmap()
+        frame %= len(ims)
+        cr = self._char_rect()
+        dw = max(1, int(round(cr.width() * plug['scale'])))
+        img = ims[frame]
+        dh = max(1, int(round(dw * img.height() / max(1, img.width()))))
+        key = (plug['id'], frame, dw, dh)
+        if key not in self._deco_cache:
+            pm = QPixmap.fromImage(img).scaled(dw, dh, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            self._deco_cache[key] = pm
+            if len(self._deco_cache) > 220:
+                self._deco_cache.pop(next(iter(self._deco_cache)))
+        return self._deco_cache[key]
+
+    def _draw_decos(self, p, behind):
+        cr = self._char_rect()
+        for plug in self._active_decos(behind):
+            st = self._deco_state.setdefault(plug['id'], {'frame': 0, 'acc': 0.0})
+            st['frame'] %= max(1, len(plug['images']))
+            pm = self._deco_pixmap(plug, st['frame'])
+            if pm.isNull():
+                continue
+            cx = cr.left() + plug['anchor'][0] * cr.width()
+            cy = cr.top() + plug['anchor'][1] * cr.height()
+            x = int(round(cx - pm.width() / 2))
+            y = int(round(cy - pm.height() / 2))
+            p.drawPixmap(x, y, pm)
+
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
+        # z 序：身后装饰 → 角色 → 身前装饰
+        self._draw_decos(p, behind=True)
+        cr = self._char_rect()
         pm = self.pixmap(self.frame)
         if not pm.isNull():
-            p.drawPixmap(self.rect(), pm)
+            p.drawPixmap(cr.left(), cr.top(), pm)
+        self._draw_decos(p, behind=False)
 
     # ---------- 位置 ----------
     def _restore_pos(self):
@@ -412,10 +585,10 @@ class Pet(QWidget):
         newh = max(MIN_HEIGHT, min(MAX_HEIGHT, self.pet_height + step))
         if newh != self.pet_height:
             cx = self.x() + self.width() / 2
-            by = self.y() + self.pet_height
+            by = self.y() + self.height()
             self.pet_height = newh
             self._apply_size()
-            self.move(int(cx - self.width() / 2), int(by - self.pet_height))
+            self.move(int(cx - self.width() / 2), int(by - self.height()))
             self.settings.setValue("height", self.pet_height)
             self.bubble.place()
 
@@ -432,8 +605,12 @@ class Pet(QWidget):
         zones = CFG["regions"]
         if not zones:
             return None
-        nx = pos.x() / max(1, self.width())
-        ny = pos.y() / max(1, self.height())
+        # 命中坐标相对"角色矩形"，需扣掉画布四周内边距
+        cr = self._char_rect()
+        nx = (pos.x() - cr.left()) / max(1, cr.width())
+        ny = (pos.y() - cr.top()) / max(1, cr.height())
+        if nx < 0 or nx > 1 or ny < 0 or ny > 1:
+            return None
 
         def area(z):
             x0, y0, x1, y1 = z["rect"]
@@ -516,11 +693,11 @@ class Pet(QWidget):
         cp = QCursor.pos()
         screen = QGuiApplication.primaryScreen().availableGeometry()
         if self.edge_side == "left":
-            near = abs(cp.x() - screen.left()) < 46 and self.y() <= cp.y() <= self.y() + self.pet_height
+            near = abs(cp.x() - screen.left()) < 46 and self.y() <= cp.y() <= self.y() + self.height()
             if near:
                 self.move(screen.left(), self.y()); self.edge_side = None
         else:
-            near = abs(cp.x() - screen.right()) < 46 and self.y() <= cp.y() <= self.y() + self.pet_height
+            near = abs(cp.x() - screen.right()) < 46 and self.y() <= cp.y() <= self.y() + self.height()
             if near:
                 self.move(screen.right() - self.width(), self.y()); self.edge_side = None
 
@@ -547,6 +724,28 @@ class Pet(QWidget):
         for label, mode in [("框内即命中", "any"), ("仅命中角色像素", "opaque")]:
             a = hit.addAction(label); a.setCheckable(True); a.setChecked(self.hit_mode == mode)
             a.triggered.connect(lambda _, m=mode: self.set_hit_mode(m))
+
+        # 衣柜：按槽位列出装饰，点选切换；无插件时给出提示项
+        wardrobe = menu.addMenu("👗 衣柜 / 装饰")
+        if not self.plugins:
+            tip = wardrobe.addAction("（未发现装饰插件）")
+            tip.setEnabled(False)
+        else:
+            for s in SLOT_ORDER:
+                slot_plugins = [p for p in self.plugins if p['slot'] == s]
+                if not slot_plugins:
+                    continue
+                sub = wardrobe.addMenu(SLOTS[s]['label'])
+                none_act = sub.addAction("无装饰")
+                none_act.setCheckable(True)
+                none_act.setChecked(not self.deco_sel.get(s, ""))
+                none_act.triggered.connect(lambda _, sl=s: self.set_deco(sl, ""))
+                sub.addSeparator()
+                for plug in slot_plugins:
+                    a = sub.addAction(plug['name'])
+                    a.setCheckable(True)
+                    a.setChecked(self.deco_sel.get(s, "") == plug['id'])
+                    a.triggered.connect(lambda _, sl=s, pid=plug['id']: self.set_deco(sl, pid))
 
         menu.addSeparator()
         a = menu.addAction("始终置顶"); a.setCheckable(True); a.setChecked(self.on_top); a.triggered.connect(self.toggle_ontop)
@@ -576,6 +775,21 @@ class Pet(QWidget):
         self._style_menu(tm)
         a = tm.addAction("显示 / 隐藏"); a.triggered.connect(self._toggle_visible)
         a = tm.addAction("暂停 / 继续"); a.triggered.connect(self.toggle_play)
+        if self.plugins:
+            tw = tm.addMenu("👗 衣柜 / 装饰")
+            for s in SLOT_ORDER:
+                slot_plugins = [p for p in self.plugins if p['slot'] == s]
+                if not slot_plugins:
+                    continue
+                sub = tw.addMenu(SLOTS[s]['label'])
+                na = sub.addAction("无装饰"); na.setCheckable(True)
+                na.setChecked(not self.deco_sel.get(s, ""))
+                na.triggered.connect(lambda _, sl=s: self.set_deco(sl, ""))
+                sub.addSeparator()
+                for plug in slot_plugins:
+                    a2 = sub.addAction(plug['name']); a2.setCheckable(True)
+                    a2.setChecked(self.deco_sel.get(s, "") == plug['id'])
+                    a2.triggered.connect(lambda _, sl=s, pid=plug['id']: self.set_deco(sl, pid))
         tm.addSeparator()
         a = tm.addAction("退出"); a.triggered.connect(self.quit_app)
         self.tray.setContextMenu(tm)
@@ -603,16 +817,26 @@ class Pet(QWidget):
 
     def set_height(self, h):
         cx = self.x() + self.width() / 2
-        by = self.y() + self.pet_height
+        by = self.y() + self.height()
         self.pet_height = h
         self._apply_size()
-        self.move(int(cx - self.width() / 2), int(by - self.pet_height))
+        self.move(int(cx - self.width() / 2), int(by - self.height()))
         self.settings.setValue("height", h)
         self.bubble.place()
 
     def set_hit_mode(self, m):
         self.hit_mode = m
         self.settings.setValue("hitmode", m)
+
+    def set_deco(self, slot, pid):
+        """切换某槽位的装饰；pid 为空表示卸下。"""
+        if pid and not any(p['id'] == pid and p['slot'] == slot for p in self.plugins):
+            return
+        self.deco_sel[slot] = pid
+        self.settings.setValue("deco_" + slot, pid)
+        self.settings.sync()
+        self._deco_cache.clear()
+        self.update()
 
     def toggle_ontop(self):
         self.on_top = not self.on_top

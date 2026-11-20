@@ -16,11 +16,12 @@ import re
 import json
 import shutil
 import time
+import zipfile
 import traceback
 import subprocess
 
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QPoint, QPointF, QRect, QRectF, QEvent, QSettings,
+    Qt, QThread, Signal, QPoint, QPointF, QRect, QRectF, QEvent, QSettings, QByteArray, QBuffer, QTimer,
 )
 from PySide6.QtGui import (
     QImage, QPixmap, QColor, QFont, QPainter, QPen, QBrush, QCursor,
@@ -81,6 +82,21 @@ PALETTE = [
     ("#69db7c", "绿"), ("#4dabf7", "蓝"), ("#9775fa", "紫"),
     ("#f783ac", "粉"), ("#63e6be", "青"),
 ]
+
+# 装饰插件槽位（与 pet.py SLOTS 保持一致）
+PLUGIN_SLOTS = [
+    ("feet", "脚底", [0.50, 0.94], 1.30, True),
+    ("head", "头顶", [0.50, 0.04], 0.55, False),
+    ("back", "身后", [0.50, 0.55], 1.10, True),
+    ("front", "身前", [0.50, 0.60], 0.60, False),
+]
+
+
+def slot_info(slot):
+    for s in PLUGIN_SLOTS:
+        if s[0] == slot:
+            return s
+    return PLUGIN_SLOTS[0]
 
 
 def natural_key(s):
@@ -218,6 +234,44 @@ class BuildWorker(QThread):
             with open(os.path.join(work, 'config.json'), 'w', encoding='utf-8') as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
 
+            # 装饰插件：把每个插件文件夹压缩为 zip，输出到 exe 同目录的 plugins/
+            plugins = o.get('plugins', [])
+            if plugins:
+                plug_out = os.path.join(o['out_dir'], 'plugins')
+                os.makedirs(plug_out, exist_ok=True)
+                for idx, plug in enumerate(plugins):
+                    if not plug.get('src_dir') or not os.path.isdir(plug['src_dir']):
+                        self.emit_log("  跳过（文件夹不存在）: " + plug.get('name', '?'))
+                        continue
+                    pfiles = image_files(plug['src_dir'])
+                    if not pfiles:
+                        self.emit_log("  跳过空插件文件夹: " + plug.get('name', '?'))
+                        continue
+                    name = safe_name(plug.get('name') or ('装饰%d' % (idx + 1)))
+                    meta = {
+                        'name': plug.get('name') or ('装饰%d' % (idx + 1)),
+                        'slot': plug.get('slot', 'feet'),
+                        'anchor': plug.get('anchor', slot_info(plug.get('slot', 'feet'))[2]),
+                        'scale': plug.get('scale', slot_info(plug.get('slot', 'feet'))[3]),
+                        'behind': plug.get('behind', slot_info(plug.get('slot', 'feet'))[4]),
+                        'fps': plug.get('fps', 12),
+                    }
+                    zip_path = os.path.join(plug_out, name + '.zip')
+                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        zf.writestr('meta.json', json.dumps(meta, ensure_ascii=False, indent=2))
+                        for k, src in enumerate(pfiles):
+                            im = QImage(src)
+                            if im.isNull():
+                                continue
+                            ba = QByteArray()
+                            buf = QBuffer(ba)
+                            buf.open(QBuffer.WriteOnly)
+                            im.save(buf, 'WEBP', 85)
+                            buf.close()
+                            zf.writestr('frames/frame_%04d.webp' % k, bytes(ba.data()))
+                    self.emit_log("  装饰插件已打包: %s (%d 帧)" % (os.path.basename(zip_path), len(pfiles)))
+                self.emit_log("装饰插件输出到: " + plug_out)
+
             self.emit_log("资源处理完成，开始打包 exe（约需 30-90 秒）...")
             self.progress.emit(42)
 
@@ -271,6 +325,7 @@ class RegionPreview(QFrame):
     """
     zoneClicked = Signal(int)
     zonesChanged = Signal()
+    decoChanged = Signal(int)   # 预览里拖动/缩放某装饰后通知写回配置（插件索引）
 
     def __init__(self):
         super().__init__()
@@ -294,6 +349,78 @@ class RegionPreview(QFrame):
         self._panning = False
         self._pan_start = None
         self._pan_origin = None
+        # 装饰插件预览（与 pet.py 运行时同算法）
+        self.deco_items = []      # [{pixmaps, slot, anchor, scale, behind, fps, dx, dy, vis}]
+        self._deco_frame = 0
+        self._deco_tick = QTimer(self)
+        self._deco_tick.timeout.connect(self._advance_deco)
+        self._deco_tick.start(80)
+        # 逐图层变换（预览专用，不影响打包配置）：每个对象有 dx/dy(相对角色矩形宽高的比例) 与 scaleMul
+        self.char_dx = 0.0; self.char_dy = 0.0; self.char_scale_mul = 1.0; self.char_vis = True
+        self._sel = None          # ('char',) 或 ('deco', idx)
+        self._move_drag = None    # (item, start_pos, start_dx, start_dy)
+        self._char_playing = True
+        self._deco_playing = True
+        self._char_frames = []    # 角色动画帧（用于预览播放）
+        self._char_frame = 0
+        self._char_tick = QTimer(self)
+        self._char_tick.timeout.connect(self._advance_char)
+        self._char_tick.start(80)
+
+    def set_decorations(self, plugins):
+        """从生成器的插件状态装载装饰帧，用于预览。"""
+        items = []
+        for p in plugins or []:
+            src = p.get('src_dir', '')
+            if not src or not os.path.isdir(src):
+                continue
+            files = image_files(src)
+            pixes = [QPixmap(f) for f in files]
+            pixes = [pm for pm in pixes if not pm.isNull()]
+            if not pixes:
+                continue
+            slot = p.get('slot', 'feet')
+            info = slot_info(slot)
+            items.append({
+                'pixmaps': pixes,
+                'slot': slot,
+                'anchor': list(p.get('anchor', info[2])),
+                'scale': float(p.get('scale', info[3])),
+                'behind': bool(p.get('behind', info[4])),
+                'fps': max(1, int(p.get('fps', 12))),
+                'dx': 0.0, 'dy': 0.0,          # 预览位移（归一化到角色矩形）
+                'scale_mul': 1.0,              # 预览缩放倍率
+                'vis': True,                    # 该装饰是否显示/播放
+            })
+        # 尽量保留原有选中对象的预览变换（按插件索引对应）
+        old = getattr(self, '_deco_items_by_idx', {})
+        for i, it in enumerate(items):
+            if i in old:
+                it['dx'] = old[i].get('dx', 0.0); it['dy'] = old[i].get('dy', 0.0)
+                it['scale_mul'] = old[i].get('scale_mul', 1.0)
+                it['vis'] = old[i].get('vis', True)
+        self.deco_items = items
+        self._deco_items_by_idx = {i: it for i, it in enumerate(items)}
+        if self._sel and self._sel[0] == 'deco' and self._sel[1] >= len(items):
+            self._sel = None
+        self._deco_frame = 0
+        self.update()
+
+    def _advance_deco(self):
+        if self._deco_playing and (len(self.deco_items) > 1 or
+                (self.deco_items and len(self.deco_items[0]['pixmaps']) > 1)):
+            self._deco_frame += 1
+            self.update()
+
+    def _advance_char(self):
+        if self._char_playing and len(self._char_frames) > 1:
+            self._char_frame = (self._char_frame + 1) % len(self._char_frames)
+            self.update()
+
+    def set_char_frames(self, files):
+        self._char_frames = [QPixmap(f) for f in files]
+        self._char_frames = [pm for pm in self._char_frames if not pm.isNull()]
+        self._char_frame = 0
 
     def set_image(self, path):
         self._pm = QPixmap(path)
@@ -318,12 +445,52 @@ class RegionPreview(QFrame):
     def mask_image(self):
         return self._mask
 
+    def set_mask(self, path):
+        """从已有 png 恢复涂色掩膜（导入已打包桌宠时用）。"""
+        if not path or not os.path.isfile(path):
+            return
+        img = QImage(path)
+        if not img.isNull():
+            self._mask = img.convertToFormat(QImage.Format_ARGB32)
+            self.update()
+
+    def set_zones(self, regions):
+        """从配置 regions 恢复区域（导入已打包桌宠时用）。"""
+        zones = []
+        for r in regions or []:
+            if not isinstance(r, dict) or 'rect' not in r:
+                continue
+            sp = r.get('speech', '')
+            if isinstance(sp, list):
+                sp = '\n'.join(sp)
+            zones.append({
+                'name': r.get('name', '区域'), 'type': r.get('type', 'rect'),
+                'rect': list(r['rect']), 'color': r.get('color', ''),
+                'speech': sp, 'reaction': r.get('reaction', ''),
+                'no_drag': bool(r.get('no_drag', False)),
+            })
+        self.zones = zones
+        self.selected = -1
+        self.update()
+
     def has_paint(self):
         return any(z.get('type') == 'paint' for z in self.zones)
 
     def reset_view(self):
         self.zoom = 1.0
         self._pan = QPointF(0, 0)
+        self.char_dx = 0.0; self.char_dy = 0.0; self.char_scale_mul = 1.0
+        for it in self.deco_items:
+            it['dx'] = 0.0; it['dy'] = 0.0; it['scale_mul'] = 1.0
+        self._sel = None
+        self.update()
+
+    def reset_layers(self):
+        """重置角色与装饰的位移/缩放（不动视图缩放）。"""
+        self.char_dx = 0.0; self.char_dy = 0.0; self.char_scale_mul = 1.0
+        for it in self.deco_items:
+            it['dx'] = 0.0; it['dy'] = 0.0; it['scale_mul'] = 1.0
+        self._sel = None
         self.update()
 
     # ---- 视图几何 ----
@@ -364,7 +531,96 @@ class RegionPreview(QFrame):
             return self.brush_size
         return max(2, int(self.brush_size * self._mask.width() / max(1, self._pm.width())))
 
+    # ---- 图层变换 / 命中 ----
+    def _char_disp_rect(self):
+        """角色当前显示矩形（含预览变换）。"""
+        g = self._view_geom()
+        if not g:
+            return None
+        ox, oy, dw, dh = g
+        cx = ox + (0.5 + self.char_dx) * dw
+        cy = oy + (0.5 + self.char_dy) * dh
+        w, h = dw * self.char_scale_mul, dh * self.char_scale_mul
+        return (cx - w / 2, cy - h / 2, w, h)
+
+    def _deco_disp_rect(self, idx):
+        """某装饰当前显示矩形（含预览变换）。返回 (x,y,w,h,pm) 或 None。"""
+        g = self._view_geom()
+        if not g or idx < 0 or idx >= len(self.deco_items):
+            return None
+        it = self.deco_items[idx]
+        ox, oy, dw, dh = g
+        pm = it['pixmaps'][self._deco_frame % len(it['pixmaps'])]
+        sc = it['scale'] * it['scale_mul']
+        w = max(1, int(round(dw * sc)))
+        h = max(1, int(round(w * pm.height() / max(1, pm.width()))))
+        cx = ox + (it['anchor'][0] + it['dx']) * dw
+        cy = oy + (it['anchor'][1] + it['dy']) * dh
+        return (cx - w / 2, cy - h / 2, w, h, pm)
+
+    def _alpha_hit(self, pm, rect, px, py, threshold=24):
+        """矩形命中后再查像素 alpha，透明处不算命中。"""
+        x, y, w, h = rect
+        if px < x or px > x + w or py < y or py > y + h or w <= 0 or h <= 0:
+            return False
+        try:
+            img = pm.toImage()
+            ix = int((px - x) / w * max(0, img.width() - 1))
+            iy = int((py - y) / h * max(0, img.height() - 1))
+            return img.pixelColor(ix, iy).alpha() > threshold
+        except Exception:
+            return True
+
+    def _layer_at(self, pt):
+        """返回鼠标下的图层：('char',) 或 ('deco', idx) 或 None。
+        装饰优先于角色（装饰更具体、更好选），前景优先于背景，后加的在上。"""
+        px, py = pt.x(), pt.y()
+        # 先按 z 序收集所有候选（前景装饰 → 背景装饰 → 角色）
+        cands = []
+        for i in range(len(self.deco_items) - 1, -1, -1):
+            it = self.deco_items[i]
+            if not it['vis']:
+                continue
+            r = self._deco_disp_rect(i)
+            if r and self._alpha_hit(r[4], r[:4], px, py):
+                # 前景优先（behind=False 排前面），同级保持 z 序
+                cands.append((0 if not it['behind'] else 1, i))
+        cr = self._char_disp_rect()
+        if cr and self.char_vis and self._alpha_hit(self._pm, cr, px, py):
+            cands.append((2, -1))
+        if not cands:
+            return None
+        cands.sort(key=lambda c: c[0])
+        return ('char',) if cands[0][1] < 0 else ('deco', cands[0][1])
+
     # ---- 绘制 ----
+    def _draw_deco(self, p, behind):
+        """按 pet.py 运行时同算法绘制装饰（叠加预览位移/缩放）：身后 → 身前。"""
+        for i, it in enumerate(self.deco_items):
+            if it['behind'] != behind or not it['vis']:
+                continue
+            r = self._deco_disp_rect(i)
+            if not r:
+                continue
+            x, y, w, h, pm = r
+            p.drawPixmap(int(round(x)), int(round(y)),
+                         pm.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+
+    def _draw_sel_box(self, p):
+        layer = self._sel
+        if not layer:
+            return
+        if layer[0] == 'char':
+            r = self._char_disp_rect()
+            rect = QRect(int(r[0]), int(r[1]), int(r[2]), int(r[3])) if r else None
+        else:
+            rr = self._deco_disp_rect(layer[1])
+            rect = QRect(int(rr[0]), int(rr[1]), int(rr[2]), int(rr[3])) if rr else None
+        if rect:
+            pen = QPen(QColor('#7ee787')); pen.setWidth(2); pen.setStyle(Qt.DashLine)
+            p.setPen(pen); p.setBrush(QBrush(Qt.NoBrush))
+            p.drawRect(rect.adjusted(-2, -2, 2, 2))
+
     def paintEvent(self, _):
         super().paintEvent(_)
         p = QPainter(self)
@@ -373,11 +629,26 @@ class RegionPreview(QFrame):
         if g and not self._pm.isNull():
             ox, oy, dw, dh = g
             target = QRect(int(ox), int(oy), int(dw), int(dh))
-            p.drawPixmap(target, self._pm)
+            # z 序与桌宠运行时一致：身后装饰 → 角色 → 身前装饰
+            self._draw_deco(p, behind=True)
+            if self.char_vis:
+                if self._char_playing and self._char_frames:
+                    cm = self._char_frames[self._char_frame % len(self._char_frames)]
+                    cr = self._char_disp_rect()
+                    if cr:
+                        rect = QRect(int(cr[0]), int(cr[1]), int(cr[2]), int(cr[3]))
+                        p.drawPixmap(rect, cm.scaled(rect.width(), rect.height(),
+                                                     Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+                else:
+                    cr = self._char_disp_rect()
+                    rect = QRect(int(cr[0]), int(cr[1]), int(cr[2]), int(cr[3])) if cr else target
+                    p.drawPixmap(rect, self._pm)
+            self._draw_deco(p, behind=False)
             if not self._mask.isNull():
                 p.setOpacity(0.72)
                 p.drawImage(target, self._mask)
                 p.setOpacity(1.0)
+        self._draw_sel_box(p)
         for i, z in enumerate(self.zones):
             x0, y0, x1, y1 = z['rect']
             a = self._to_widget(min(x0, x1), min(y0, y1))
@@ -462,6 +733,17 @@ class RegionPreview(QFrame):
 
     # ---- 鼠标交互 ----
     def mousePressEvent(self, e):
+        # Ctrl+左键：选中并拖动图层（角色 / 装饰）
+        if e.button() == Qt.LeftButton and (e.modifiers() & Qt.ControlModifier):
+            layer = self._layer_at(e.position())
+            self._sel = layer
+            if layer:
+                self._move_drag = (layer, e.position(),
+                                   self.char_dx if layer[0] == 'char' else self.deco_items[layer[1]]['dx'],
+                                   self.char_dy if layer[0] == 'char' else self.deco_items[layer[1]]['dy'])
+                self.setCursor(QCursor(Qt.SizeAllCursor))
+            self.update()
+            return
         if e.button() in (Qt.MiddleButton, Qt.RightButton):
             self._panning = True
             self._pan_start = e.position()
@@ -491,6 +773,21 @@ class RegionPreview(QFrame):
         self.update()
 
     def mouseMoveEvent(self, e):
+        if self._move_drag is not None:
+            layer, start, sx, sy = self._move_drag
+            g = self._view_geom()
+            if g:
+                dw, dh = g[2], g[3]
+                ddx = (e.position().x() - start.x()) / max(1.0, dw)
+                ddy = (e.position().y() - start.y()) / max(1.0, dh)
+                it = None
+                if layer[0] == 'char':
+                    self.char_dx, self.char_dy = sx + ddx, sy + ddy
+                else:
+                    it = self.deco_items[layer[1]]
+                    it['dx'], it['dy'] = sx + ddx, sy + ddy
+                self.update()
+            return
         if self._panning and self._pan_start is not None:
             d = e.position() - self._pan_start
             self._pan = self._pan_origin + QPointF(d.x(), d.y())
@@ -503,6 +800,15 @@ class RegionPreview(QFrame):
             self.update()
 
     def mouseReleaseEvent(self, e):
+        if self._move_drag is not None and e.button() == Qt.LeftButton:
+            layer = self._move_drag[0]
+            self._move_drag = None
+            self.unsetCursor()
+            # 通知外部把预览位移/缩放写回配置（不在预览内改 anchor，避免重建时丢失）
+            if layer[0] == 'deco' and layer[1] < len(self.deco_items):
+                self.decoChanged.emit(layer[1])
+            self.update()
+            return
         if e.button() in (Qt.MiddleButton, Qt.RightButton):
             self._panning = False
             self._pan_start = None
@@ -526,6 +832,37 @@ class RegionPreview(QFrame):
         if not delta:
             e.ignore(); return
         mouse = e.position()
+        factor = 1.12 if delta > 0 else 1 / 1.12
+        # Ctrl+滚轮：只缩放鼠标下的图层（角色 / 装饰），以鼠标为锚点
+        if e.modifiers() & Qt.ControlModifier:
+            layer = self._layer_at(mouse)
+            g = self._view_geom()
+            if layer and g:
+                dw, dh = g[2], g[3]
+                ox, oy = g[0], g[1]
+                if layer[0] == 'char':
+                    old = self.char_scale_mul
+                    new = max(0.25, min(5.0, old * factor))
+                    self.char_scale_mul = new
+                    # 保持鼠标处不动：以鼠标为锚点反推中心位移
+                    cx = ox + (0.5 + self.char_dx) * dw
+                    cy = oy + (0.5 + self.char_dy) * dh
+                    self.char_dx += (mouse.x() - cx) * (1 - new / old) / max(1.0, dw)
+                    self.char_dy += (mouse.y() - cy) * (1 - new / old) / max(1.0, dh)
+                    self._sel = ('char',)
+                else:
+                    it = self.deco_items[layer[1]]
+                    old = it['scale_mul']
+                    new = max(0.15, min(8.0, old * factor))
+                    it['scale_mul'] = new
+                    cx = ox + (it['anchor'][0] + it['dx']) * dw
+                    cy = oy + (it['anchor'][1] + it['dy']) * dh
+                    it['dx'] += (mouse.x() - cx) * (1 - new / old) / max(1.0, dw)
+                    it['dy'] += (mouse.y() - cy) * (1 - new / old) / max(1.0, dh)
+                    self._sel = layer
+                    self.decoChanged.emit(layer[1])
+                self.update(); e.accept(); return
+        # 普通滚轮：以鼠标为中心缩放整个视图
         before = self._to_norm(mouse)
         self.zoom = max(0.25, min(6.0, self.zoom * (1.16 if delta > 0 else 1 / 1.16)))
         if before:
@@ -615,6 +952,8 @@ class Builder(QWidget):
         self.setStyleSheet(self.qss())
         self.worker = None
         self._editing_zone = False
+        self._plugins_state = []   # 装饰插件列表：dict(src_dir,name,slot,anchor,scale,fps,behind)
+        self._editing_plugin = False
         self._build_ui()
         self._load_builder_settings()
 
@@ -674,6 +1013,13 @@ class Builder(QWidget):
         btn_src = QPushButton("选择文件夹"); btn_src.clicked.connect(self.choose_src)
         row.addWidget(self.src_edit, 1); row.addWidget(btn_src)
         l1.addLayout(row)
+        row2 = QHBoxLayout()
+        btn_import = QPushButton("导入已打包的桌宠 exe")
+        btn_import.setObjectName('tool')
+        btn_import.setToolTip("从已打包的桌宠 exe 还原配置与素材，修改后可再次打包")
+        btn_import.clicked.connect(self.import_pet)
+        row2.addWidget(btn_import); row2.addStretch(1)
+        l1.addLayout(row2)
         self.info = QLabel("尚未选择文件夹 · 选好后可在下方预览图上框选或涂色")
         self.info.setObjectName('hint'); self.info.setWordWrap(True)
         l1.addWidget(self.info)
@@ -685,6 +1031,7 @@ class Builder(QWidget):
         self.preview = RegionPreview()
         self.preview.zoneClicked.connect(self.on_preview_zone_clicked)
         self.preview.zonesChanged.connect(self.on_zones_changed)
+        self.preview.decoChanged.connect(self.on_deco_preview_changed)
         tools = QHBoxLayout()
         self.mode_rect = QPushButton("▢ 框选"); self.mode_paint = QPushButton("◉ 涂色")
         for b in (self.mode_rect, self.mode_paint):
@@ -695,8 +1042,33 @@ class Builder(QWidget):
         tools.addWidget(self.mode_rect); tools.addWidget(self.mode_paint)
         btn_reset = QPushButton("重置视图"); btn_reset.setObjectName('tool')
         btn_reset.clicked.connect(self.preview.reset_view)
-        tools.addWidget(btn_reset); tools.addStretch(1)
+        tools.addWidget(btn_reset)
+        btn_rst_layer = QPushButton("重置图层"); btn_rst_layer.setObjectName('tool')
+        btn_rst_layer.setToolTip("把角色和装饰的拖动/缩放复位")
+        btn_rst_layer.clicked.connect(self.preview.reset_layers)
+        tools.addWidget(btn_rst_layer); tools.addStretch(1)
         lp.addLayout(tools)
+
+        # 播放 / 显示开关（针对预览）
+        playrow = QHBoxLayout()
+        playrow.setContentsMargins(0, 0, 0, 0)
+        self.cb_char_play = QCheckBox("▶ 角色动画"); self.cb_char_play.setChecked(True)
+        self.cb_char_vis = QCheckBox("角色显示"); self.cb_char_vis.setChecked(True)
+        self.cb_deco_play = QCheckBox("▶ 装饰动画"); self.cb_deco_play.setChecked(True)
+        self.cb_deco_vis = QCheckBox("装饰显示"); self.cb_deco_vis.setChecked(True)
+        for cb in (self.cb_char_play, self.cb_char_vis, self.cb_deco_play, self.cb_deco_vis):
+            cb.setToolTip("仅影响预览，不改变打包结果")
+            playrow.addWidget(cb)
+        self.cb_char_play.toggled.connect(lambda v: setattr(self.preview, '_char_playing', v))
+        self.cb_char_vis.toggled.connect(lambda v: setattr(self.preview, 'char_vis', v))
+        self.cb_deco_play.toggled.connect(lambda v: setattr(self.preview, '_deco_playing', v))
+        def _set_all_deco_vis(v):
+            for it in self.preview.deco_items:
+                it['vis'] = v
+            self.preview.update()
+        self.cb_deco_vis.toggled.connect(_set_all_deco_vis)
+        playrow.addStretch(1)
+        lp.addLayout(playrow)
 
         self.paint_tools = QWidget()
         pt = QHBoxLayout(self.paint_tools); pt.setContentsMargins(0, 0, 0, 0)
@@ -717,7 +1089,8 @@ class Builder(QWidget):
         self.paint_tools.setVisible(False)
         lp.addWidget(self.paint_tools)
 
-        tip = QLabel("滚轮：以鼠标为中心缩放 · 中键/右键拖动：平移 · 框选：左键拖拽 · 涂色：选色后左键涂抹")
+        tip = QLabel("Ctrl+滚轮：单独缩放鼠标下的角色/装饰 · Ctrl+左键拖动：移动角色/装饰（装饰位置会写回插件配置）\n"
+                     "滚轮：整体缩放 · 中键/右键拖动：平移 · 普通左键：框选/涂色")
         tip.setObjectName('hint'); tip.setWordWrap(True)
         lp.addWidget(tip)
         lp.addWidget(self.preview, 1)
@@ -794,6 +1167,47 @@ class Builder(QWidget):
         self.cb_edge = QCheckBox("启用贴边自动收纳（拖到屏幕边缘自动收起，鼠标靠近再弹出）"); self.cb_edge.setChecked(True)
         fs.addWidget(self.cb_double); fs.addWidget(self.cb_edge)
         rv.addWidget(g_sw)
+
+        # 装饰插件（衣柜）
+        g_plug = QGroupBox("装饰插件（衣柜 · 右键换装）")
+        fp = QVBoxLayout(g_plug)
+        plug_tip = QLabel("添加脚底光效等装饰序列帧文件夹，打包后压缩为 zip 放到 exe 同目录的 plugins\\，桌宠右键可换装。")
+        plug_tip.setObjectName('hint'); plug_tip.setWordWrap(True)
+        fp.addWidget(plug_tip)
+        self.plug_list = QComboBox()
+        self.plug_list.currentIndexChanged.connect(self.load_plugin_to_editor)
+        fp.addWidget(self.plug_list)
+        prow = QHBoxLayout()
+        b_add = QPushButton("添加文件夹"); b_add.setObjectName('tool'); b_add.clicked.connect(self.add_plugin)
+        b_del = QPushButton("移除"); b_del.setObjectName('tool'); b_del.clicked.connect(self.remove_plugin)
+        prow.addWidget(b_add); prow.addWidget(b_del); prow.addStretch(1)
+        fp.addLayout(prow)
+        plug_form = QFormLayout()
+        self.plug_name = QLineEdit()
+        plug_form.addRow("名称", self.plug_name)
+        self.plug_slot = QComboBox()
+        for key, label, _a, _s, _b in PLUGIN_SLOTS:
+            self.plug_slot.addItem(label, key)
+        plug_form.addRow("槽位", self.plug_slot)
+        self.plug_scale = WheelSpinBox(); self.plug_scale.setRange(5, 600); self.plug_scale.setValue(130)
+        plug_form.addRow("缩放(%)", self.plug_scale)
+        self.plug_fps = WheelSpinBox(); self.plug_fps.setRange(1, 60); self.plug_fps.setValue(12)
+        plug_form.addRow("帧率(fps)", self.plug_fps)
+        self.plug_ax = WheelSpinBox(); self.plug_ax.setRange(0, 100); self.plug_ax.setValue(50)
+        self.plug_ay = WheelSpinBox(); self.plug_ay.setRange(0, 100); self.plug_ay.setValue(94)
+        apos = QHBoxLayout(); apos.addWidget(self.plug_ax); apos.addWidget(QLabel("% X")); apos.addWidget(self.plug_ay); apos.addWidget(QLabel("% Y"))
+        plug_form.addRow("锚点位置", apos)
+        self.plug_behind = QCheckBox("画在角色身后（脚底/身后装饰请勾选）"); self.plug_behind.setChecked(True)
+        plug_form.addRow(self.plug_behind)
+        fp.addLayout(plug_form)
+        for w in (self.plug_name, self.plug_slot, self.plug_scale, self.plug_fps, self.plug_ax, self.plug_ay, self.plug_behind):
+            if isinstance(w, QCheckBox):
+                w.stateChanged.connect(self.on_plugin_field_changed)
+            elif isinstance(w, QComboBox):
+                w.currentIndexChanged.connect(self.on_plugin_field_changed)
+            else:
+                w.textChanged.connect(self.on_plugin_field_changed) if isinstance(w, QLineEdit) else w.valueChanged.connect(self.on_plugin_field_changed)
+        rv.addWidget(g_plug)
 
         g_look = QGroupBox("⑧ 外观与动画")
         fl = QFormLayout(g_look)
@@ -884,6 +1298,7 @@ class Builder(QWidget):
             'region_drag_block': self.cb_region_drag.isChecked(),
             'double': self.cb_double.isChecked(), 'edge': self.cb_edge.isChecked(),
             'src': self.src_edit.text(), 'out': self.out_edit.text(),
+            'plugins': [dict(p) for p in self._plugins_state],
         }
 
     def _apply_last_config(self, c):
@@ -908,6 +1323,11 @@ class Builder(QWidget):
             self.cb_edge.setChecked(bool(c.get('edge', True)))
             if c.get('out') and os.path.isdir(c['out']):
                 self.out_edit.setText(c['out'])
+            plugs = c.get('plugins', [])
+            if isinstance(plugs, list):
+                self._plugins_state = [dict(p) for p in plugs if isinstance(p, dict) and p.get('src_dir')]
+            self.refresh_plugin_list()
+            self._sync_preview_decos()
         except Exception:
             pass
 
@@ -933,6 +1353,125 @@ class Builder(QWidget):
         if d:
             self.src_edit.setText(d); self.refresh_preview(d)
 
+    def _extract_helper_path(self):
+        """定位解包助手脚本（源码 / frozen 两种模式）。"""
+        if hasattr(sys, '_MEIPASS'):
+            p = os.path.join(sys._MEIPASS, 'pet_extract.py')
+            if os.path.isfile(p):
+                return p
+        return os.path.join(app_dir(), 'pet_extract.py')
+
+    def import_pet(self):
+        """从已打包的桌宠 exe 还原配置与素材到生成器，便于修改后再次打包。"""
+        exe, _ = QFileDialog.getOpenFileName(self, "选择已打包的桌宠 exe", "", "桌宠 exe (*.exe)")
+        if not exe:
+            return
+        helper = self._extract_helper_path()
+        if not os.path.isfile(helper):
+            QMessageBox.critical(self, "缺少组件", "找不到解包助手 pet_extract.py"); return
+        py = find_python()
+        if not py:
+            QMessageBox.critical(self, "缺少 Python", "找不到可用的 Python 解释器"); return
+
+        # 解包到桌宠同目录下的 _还原工程 文件夹（稳定，避免临时目录被清理）
+        exe_dir = os.path.dirname(exe)
+        proj = os.path.join(exe_dir, '_还原工程_' + os.path.splitext(os.path.basename(exe))[0])
+        try:
+            os.makedirs(proj, exist_ok=True)
+        except Exception as e:
+            QMessageBox.critical(self, "无法创建工程目录", str(e)); return
+        self.append_log("正在从桌宠 exe 还原工程: " + exe)
+
+        import subprocess as _sp
+        cmd = [py, helper, exe, proj]
+        env = os.environ.copy(); env['PYTHONIOENCODING'] = 'utf-8'; env['PYTHONUTF8'] = '1'
+        try:
+            proc = _sp.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', timeout=120, env=env,
+                           creationflags=getattr(_sp, 'CREATE_NO_WINDOW', 0))
+            out = (proc.stdout or '').strip()
+            # 取最后一行 JSON
+            line = out.splitlines()[-1] if out else ''
+            m = json.loads(line)
+        except Exception as e:
+            QMessageBox.critical(self, "解包失败", "无法运行解包助手：\n%s\n\n%s" % (e, (proc.stderr or '')[-500:] if 'proc' in dir() else ''))
+            return
+        if not m.get('ok'):
+            QMessageBox.critical(self, "解包失败", m.get('error', '未知错误')[-1200:]); return
+
+        cfg = m.get('config', {})
+        assets = m.get('assets_dir', '')
+        if not assets or not os.path.isdir(assets) or not image_files(assets):
+            QMessageBox.critical(self, "解包失败", "没能在 exe 里找到素材帧"); return
+
+        # ---- 回填素材与预览 ----
+        self.src_edit.setText(assets)
+        self.refresh_preview(assets)
+        self.name_edit.setText(cfg.get('name', os.path.splitext(os.path.basename(exe))[0]))
+
+        # ---- 台词 / 点击反应 / 外观 ----
+        speech = cfg.get('speech', [])
+        self.speech_edit.setPlainText('\n'.join(speech) if isinstance(speech, list) else str(speech))
+        reacts = cfg.get('click_reactions', [])
+        for v, cb in self.react_checks.items():
+            cb.setChecked(v in reacts)
+        self.height_spin.setValue(int(cfg.get('default_height', 420)))
+        self.fps.setValue(int(cfg.get('default_fps', 24)))
+        self.bt.setText(cfg.get('bubble_text', '#ffe9ea'))
+        self.bbg.setText(cfg.get('bubble_bg', 'rgba(32,26,30,216)'))
+        self.bbd.setText(cfg.get('bubble_border', 'rgba(230,90,90,180)'))
+        self.fs.setValue(int(cfg.get('bubble_font_size', 13)))
+        self.cb_double.setChecked(bool(cfg.get('double_click_hide', True)))
+        self.cb_edge.setChecked(bool(cfg.get('edge_hide', True)))
+        hi = self.hit_combo.findData(cfg.get('hit_mode', 'any'))
+        self.hit_combo.setCurrentIndex(hi if hi >= 0 else 0)
+        self.drag_th.setValue(int(cfg.get('drag_threshold', 5)))
+        self.cb_region_drag.setChecked(bool(cfg.get('region_drag_block', False)))
+
+        # 清晰度：按解包帧高度推断
+        first = QImage(image_files(assets)[0])
+        fh = first.height() if not first.isNull() else 0
+        opts = [700, 900, 1200, 1600]
+        nearest = min(opts, key=lambda x: abs(x - fh)) if fh else 900
+        if fh and abs(nearest - fh) <= 80:
+            self.target_h.setCurrentText(str(nearest))
+        else:
+            self.target_h.setCurrentText('保持原始尺寸')
+
+        # ---- 区域 / 涂色掩膜 ----
+        self.preview.set_zones(cfg.get('regions', []))
+        if m.get('mask_path'):
+            self.preview.set_mask(m['mask_path'])
+        self.refresh_zone_combo()
+
+        # ---- 装饰插件 ----
+        plugs = []
+        for p in m.get('plugins', []):
+            if p.get('_error') or not p.get('_src_dir'):
+                continue
+            if not os.path.isdir(p['_src_dir']) or not image_files(p['_src_dir']):
+                continue
+            plugs.append({
+                'src_dir': p['_src_dir'], 'name': p.get('name', p.get('_zip_name', '装饰')),
+                'slot': p.get('slot', 'feet'), 'anchor': list(p.get('anchor', [0.5, 0.94])),
+                'scale': float(p.get('scale', 1.3)), 'fps': int(p.get('fps', 12)),
+                'behind': bool(p.get('behind', True)),
+            })
+        self._plugins_state = plugs
+        self.refresh_plugin_list()
+        self._sync_preview_decos()
+        if plugs:
+            self.plug_list.setCurrentIndex(0)
+
+        # 输出位置设为 exe 所在目录，方便覆盖还原
+        self.out_edit.setText(exe_dir)
+
+        self.append_log("还原完成：%d 帧 · %d 区域 · %d 装饰 → 可修改后重新打包" %
+                        (m.get('frame_count', 0), len(cfg.get('regions', [])), len(plugs)))
+        self.append_log("工程目录: " + proj)
+        QMessageBox.information(self, "导入成功",
+            "已还原桌宠「%s」的全部设计与素材。\n\n现在可以修改名称/台词/区域/装饰等，然后点“开始打包桌宠”重新生成。\n\n注意：素材帧来自已压缩的 exe，二次打包画质可能略有下降。" % cfg.get('name', ''))
+
     def choose_out(self):
         d = QFileDialog.getExistingDirectory(self, "选择 exe 输出文件夹")
         if d:
@@ -946,6 +1485,8 @@ class Builder(QWidget):
         if img.isNull():
             self.info.setText("首图无法读取"); return
         self.preview.set_image(files[0])
+        self.preview.set_char_frames(files)
+        self._sync_preview_decos()
         self.preview.clear_zones()
         self.refresh_zone_combo()
         self.zone_hint.setText("在左栏框选或涂色后，这里编辑对应事件；颜色区域按色块区分")
@@ -1035,6 +1576,123 @@ class Builder(QWidget):
         self.refresh_zone_combo()
         self.zone_hint.setText("在左栏框选或涂色后，这里编辑对应事件")
 
+    # ---------- 装饰插件管理 ----------
+    def _sync_preview_decos(self):
+        """把当前插件状态同步到预览区。"""
+        self.preview.set_decorations(self._plugins_state)
+
+    def on_deco_preview_changed(self, idx):
+        """预览里拖动/缩放装饰后，把 effective anchor/scale 写回插件配置与编辑器字段。"""
+        if idx < 0 or idx >= len(self.preview.deco_items) or idx >= len(self._plugins_state):
+            return
+        it = self.preview.deco_items[idx]
+        ax = it['anchor'][0] + it['dx']
+        ay = it['anchor'][1] + it['dy']
+        sc = it['scale'] * it['scale_mul']
+        # 归一化锚点，限制在合理范围
+        ax = max(-0.5, min(1.5, ax)); ay = max(-0.5, min(1.5, ay))
+        sc = max(0.05, min(6.0, sc))
+        it['anchor'] = [ax, ay]; it['scale'] = sc
+        it['dx'] = 0.0; it['dy'] = 0.0; it['scale_mul'] = 1.0
+        p = self._plugins_state[idx]
+        p['anchor'] = [ax, ay]; p['scale'] = sc
+        # 同步到编辑器控件（只在该插件正被编辑时）
+        if self.plug_list.currentIndex() == idx:
+            self._editing_plugin = True
+            self.plug_scale.setValue(int(round(sc * 100)))
+            self.plug_ax.setValue(int(round(ax * 100)))
+            self.plug_ay.setValue(int(round(ay * 100)))
+            self._editing_plugin = False
+        self.plug_list.blockSignals(True)
+        self.refresh_plugin_list()
+        self.plug_list.setCurrentIndex(idx)
+        self.plug_list.blockSignals(False)
+        self.append_log("预览调整了装饰「%s」：锚点 (%.2f, %.2f)，缩放 %.0f%%" %
+                        (p.get('name', '?'), ax, ay, sc * 100))
+
+    def refresh_plugin_list(self):
+        self.plug_list.blockSignals(True)
+        self.plug_list.clear()
+        for i, p in enumerate(self._plugins_state):
+            folder = os.path.basename(os.path.normpath(p.get('src_dir', '')))
+            self.plug_list.addItem("%d. %s  [%s]  %s" % (
+                i + 1, p.get('name', '?'), slot_info(p.get('slot', 'feet'))[1], folder), i)
+        self.plug_list.blockSignals(False)
+
+    def add_plugin(self):
+        d = QFileDialog.getExistingDirectory(self, "选择装饰序列帧文件夹（如：地面 脚底光效）")
+        if not d:
+            return
+        imgs = image_files(d)
+        if not imgs:
+            QMessageBox.warning(self, "没有图片", "该文件夹里没有找到图片（png/jpg/webp/bmp/gif）")
+            return
+        folder_name = os.path.basename(os.path.normpath(d))
+        # 根据文件夹名猜槽位
+        slot = 'feet'
+        if any(k in folder_name for k in ('头顶', '头饰', '光环', 'head')):
+            slot = 'head'
+        elif any(k in folder_name for k in ('身后', '翅膀', '背', 'back', 'wing')):
+            slot = 'back'
+        elif any(k in folder_name for k in ('身前', '手持', 'front')):
+            slot = 'front'
+        _key, _label, anchor, scale, behind = slot_info(slot)
+        self._plugins_state.append({
+            'src_dir': d, 'name': folder_name, 'slot': slot,
+            'anchor': list(anchor), 'scale': scale, 'fps': 12, 'behind': behind,
+        })
+        self.refresh_plugin_list()
+        self.plug_list.setCurrentIndex(len(self._plugins_state) - 1)
+        self._sync_preview_decos()
+        self.append_log("已添加装饰插件: %s（%d 帧，%s）— 预览区应已显示" % (folder_name, len(imgs), _label))
+
+    def remove_plugin(self):
+        idx = self.plug_list.currentIndex()
+        if idx < 0 or idx >= len(self._plugins_state):
+            QMessageBox.information(self, "提示", "请先选择一个装饰插件")
+            return
+        self._plugins_state.pop(idx)
+        self.refresh_plugin_list()
+        self._sync_preview_decos()
+        if self._plugins_state:
+            self.plug_list.setCurrentIndex(0)
+            self.load_plugin_to_editor(0)
+
+    def load_plugin_to_editor(self, idx):
+        if idx < 0 or idx >= len(self._plugins_state):
+            return
+        p = self._plugins_state[idx]
+        self._editing_plugin = True
+        self.plug_name.setText(p.get('name', ''))
+        si = self.plug_slot.findData(p.get('slot', 'feet'))
+        self.plug_slot.setCurrentIndex(si if si >= 0 else 0)
+        self.plug_scale.setValue(int(round(p.get('scale', 1.0) * 100)))
+        self.plug_fps.setValue(int(p.get('fps', 12)))
+        a = p.get('anchor', [0.5, 0.94])
+        self.plug_ax.setValue(int(round(a[0] * 100)))
+        self.plug_ay.setValue(int(round(a[1] * 100)))
+        self.plug_behind.setChecked(bool(p.get('behind', True)))
+        self._editing_plugin = False
+
+    def on_plugin_field_changed(self, *args):
+        if getattr(self, '_editing_plugin', False):
+            return
+        idx = self.plug_list.currentIndex()
+        if idx < 0 or idx >= len(self._plugins_state):
+            return
+        p = self._plugins_state[idx]
+        p['name'] = self.plug_name.text().strip() or ('装饰%d' % (idx + 1))
+        p['slot'] = self.plug_slot.currentData() or 'feet'
+        p['scale'] = self.plug_scale.value() / 100.0
+        p['fps'] = self.plug_fps.value()
+        p['anchor'] = [self.plug_ax.value() / 100.0, self.plug_ay.value() / 100.0]
+        p['behind'] = self.plug_behind.isChecked()
+        self.refresh_plugin_list()
+        self.plug_list.blockSignals(True)
+        self.plug_list.setCurrentIndex(idx)
+        self.plug_list.blockSignals(False)
+        self._sync_preview_decos()
+
     # ---------- 打包 ----------
     def open_out(self):
         p = self.out_edit.text()
@@ -1077,6 +1735,7 @@ class Builder(QWidget):
             region_drag_block=self.cb_region_drag.isChecked(), drag_threshold=self.drag_th.value(),
             out_dir=self.out_edit.text(),
             mask_image=self.preview.mask_image(), has_paint=self.preview.has_paint(),
+            plugins=[dict(p) for p in self._plugins_state],
         )
         self.build_btn.setEnabled(False)
         self.progress.setValue(0); self.log.clear()
