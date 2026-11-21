@@ -14,6 +14,7 @@ ENV/
 
 # --- PyInstaller 打包产物（体积大、可随时重新生成，不提交）---
 build/
+_build/
 dist/
 *.spec
 *.exe

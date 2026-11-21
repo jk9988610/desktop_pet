@@ -28,7 +28,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QTextEdit, QPushButton,
-    QFileDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
+    QFileDialog, QInputDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QSpinBox, QComboBox, QProgressBar, QMessageBox, QScrollArea,
     QColorDialog, QSplitter, QToolButton, QCheckBox, QSizePolicy, QFrame,
 )
@@ -48,6 +48,8 @@ def template_dir():
 
 HERE = app_dir()
 BSETTINGS = QSettings("DesktopPetStudio", "PetBuilderSettings")
+TEMPLATES_KEY = 'pet_templates_json'   # 多套设定模板（JSON: {名称: 配置}）
+LAST_TEMPLATE_KEY = 'last_template_name'
 MASK_MAX = 400   # 涂色掩膜长边上限（低分辨率足够命中判定，删除/涂色更快）
 
 
@@ -201,7 +203,13 @@ def find_python():
             candidates.append(p)
     for root in (os.environ.get('LOCALAPPDATA', ''), os.environ.get('ProgramFiles', '')):
         if root:
-            candidates.append(os.path.join(root, 'Programs', 'Python', 'Python313', 'python.exe'))
+            base = os.path.join(root, 'Programs', 'Python')
+            if os.path.isdir(base):
+                for d in sorted(os.listdir(base), reverse=True):
+                    if d.lower().startswith('python3'):
+                        p = os.path.join(base, d, 'python.exe')
+                        if p not in candidates:
+                            candidates.append(p)
     for cand in candidates:
         if python_has_deps(cand):
             return cand
@@ -1307,6 +1315,28 @@ class Builder(QWidget):
         form.addRow("整体台词", self.speech_edit)
         rv.addWidget(g2)
 
+        # ---------- 多套设定模板 ----------
+        g_tpl = QGroupBox("套装模板（可存多套，启动自动载入上次使用的）")
+        ft = QVBoxLayout(g_tpl)
+        row_tpl = QHBoxLayout()
+        self.tpl_combo = QComboBox()
+        self.tpl_combo.setToolTip("选择模板即载入该套设定；启动时自动定位到上次使用的模板")
+        self.tpl_combo.currentIndexChanged.connect(self._on_template_combo_changed)
+        row_tpl.addWidget(self.tpl_combo, 1)
+        b_tpl_save = QPushButton("保存"); b_tpl_save.setObjectName('tool')
+        b_tpl_save.setToolTip("把当前设定写回选中的模板")
+        b_tpl_save.clicked.connect(self.save_template)
+        b_tpl_saveas = QPushButton("另存为"); b_tpl_saveas.setObjectName('tool')
+        b_tpl_saveas.clicked.connect(self.save_template_as)
+        b_tpl_del = QPushButton("删除"); b_tpl_del.setObjectName('danger')
+        b_tpl_del.clicked.connect(self.delete_template)
+        row_tpl.addWidget(b_tpl_save); row_tpl.addWidget(b_tpl_saveas); row_tpl.addWidget(b_tpl_del)
+        ft.addLayout(row_tpl)
+        tpl_hint = QLabel("载入模板后所做的修改，会在打包/关闭时自动写回该模板；“另存为”可创建新的一套。")
+        tpl_hint.setObjectName('hint'); tpl_hint.setWordWrap(True)
+        ft.addWidget(tpl_hint)
+        rv.addWidget(g_tpl)
+
         g_click = QGroupBox("④ 点击表现")
         fc = QVBoxLayout(g_click)
         lab = QLabel("点击桌宠时的动作（整体默认，可多选随机）："); lab.setObjectName('hint'); fc.addWidget(lab)
@@ -1473,6 +1503,111 @@ class Builder(QWidget):
 
         splitter.addWidget(right_host); splitter.setSizes([716, 480])  # 预览区优先：左栏约 60%，右栏保证配置不被裁切
 
+    # ---------- 多套设定模板 ----------
+    def _load_templates(self):
+        try:
+            data = json.loads(BSETTINGS.value(TEMPLATES_KEY, '{}', type=str) or '{}')
+            if isinstance(data, dict):
+                return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        except Exception:
+            pass
+        return {}
+
+    def _save_templates(self):
+        BSETTINGS.setValue(TEMPLATES_KEY, json.dumps(self._templates, ensure_ascii=False))
+        BSETTINGS.sync()
+
+    def _refresh_template_combo(self, select=None):
+        self._tpl_loading = True
+        self.tpl_combo.clear()
+        names = sorted(self._templates.keys(), key=lambda x: x.lower())
+        if names:
+            self.tpl_combo.addItems(names)
+            target = select if select in self._templates else names[0]
+            idx = self.tpl_combo.findText(target)
+            if idx >= 0:
+                self.tpl_combo.setCurrentIndex(idx)
+        else:
+            self.tpl_combo.addItem("（暂无模板，点“另存为”创建）")
+        self._tpl_loading = False
+
+    def _on_template_combo_changed(self, _idx):
+        if getattr(self, '_tpl_loading', False):
+            return
+        name = self.tpl_combo.currentText()
+        cfg = self._templates.get(name)
+        if not cfg:
+            return
+        self._apply_last_config(cfg)
+        BSETTINGS.setValue(LAST_TEMPLATE_KEY, name)
+        BSETTINGS.sync()
+        self.append_log("已载入模板：" + name)
+
+    def save_template(self):
+        name = self.tpl_combo.currentText()
+        if name not in self._templates:
+            self.save_template_as()
+            return
+        cfg = self._collect_config()
+        self._templates[name] = cfg
+        self._save_templates()
+        BSETTINGS.setValue(LAST_TEMPLATE_KEY, name)
+        BSETTINGS.sync()
+        self.append_log("模板已保存：" + name)
+
+    def save_template_as(self):
+        current = self.tpl_combo.currentText()
+        default = current if current in self._templates else ""
+        name, ok = QInputDialog.getText(self, "另存为模板", "模板名称：", text=default)
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, "名称为空", "请输入模板名称"); return
+        if name in self._templates:
+            ans = QMessageBox.question(
+                self, "覆盖模板", "模板“%s”已存在，覆盖它吗？" % name,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
+        cfg = self._collect_config()
+        self._templates[name] = cfg
+        self._save_templates()
+        self._refresh_template_combo(name)
+        BSETTINGS.setValue(LAST_TEMPLATE_KEY, name)
+        BSETTINGS.sync()
+        self.append_log("已另存模板：" + name)
+
+    def delete_template(self):
+        name = self.tpl_combo.currentText()
+        if name not in self._templates:
+            return
+        ans = QMessageBox.question(
+            self, "删除模板", "确定删除模板“%s”？此操作不可撤销。" % name,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ans != QMessageBox.Yes:
+            return
+        self._templates.pop(name, None)
+        self._save_templates()
+        if BSETTINGS.value(LAST_TEMPLATE_KEY, '', type=str) == name:
+            BSETTINGS.remove(LAST_TEMPLATE_KEY)
+        BSETTINGS.sync()
+        self._refresh_template_combo()
+        self.append_log("已删除模板：" + name)
+
+    def _remember_template(self):
+        """记录上次配置；若当前正使用某套模板，把修改自动写回该模板。"""
+        if not self.cb_remember.isChecked():
+            return
+        cfg = self._collect_config()
+        BSETTINGS.setValue('last_config', cfg)
+        name = self.tpl_combo.currentText() if hasattr(self, 'tpl_combo') else ''
+        if name in self._templates:
+            self._templates[name] = cfg
+            self._save_templates()
+            BSETTINGS.setValue(LAST_TEMPLATE_KEY, name)
+        BSETTINGS.sync()
+
     # ---------- 生成器设置持久化 ----------
     def _load_builder_settings(self):
         s = BSETTINGS
@@ -1501,11 +1636,23 @@ class Builder(QWidget):
         except Exception:
             pass
 
-        # 最后一次打开的项目（受"记住配置"开关控制）
+        # 套装模板：默认自动载入上次使用的那一套，没有模板时才回退到上次配置
+        self._templates = self._load_templates()
+        self._refresh_template_combo()
         if self.cb_remember.isChecked():
-            last = s.value('last_config', None)
-            if isinstance(last, dict):
-                self._apply_last_config(last)
+            last_tpl = s.value(LAST_TEMPLATE_KEY, '', type=str)
+            if last_tpl in self._templates:
+                self._apply_last_config(self._templates[last_tpl])
+                self._tpl_loading = True
+                idx = self.tpl_combo.findText(last_tpl)
+                if idx >= 0:
+                    self.tpl_combo.setCurrentIndex(idx)
+                self._tpl_loading = False
+                self.append_log("已自动载入上次使用的模板：" + last_tpl)
+            else:
+                last = s.value('last_config', None)
+                if isinstance(last, dict):
+                    self._apply_last_config(last)
 
     def _on_setting_changed(self):
         s = BSETTINGS
@@ -1589,8 +1736,7 @@ class Builder(QWidget):
             BSETTINGS.setValue('win_y', self.y())
         except Exception:
             pass
-        if self.cb_remember.isChecked():
-            BSETTINGS.setValue('last_config', self._collect_config())
+        self._remember_template()
         BSETTINGS.sync()
         super().closeEvent(e)
 
@@ -2024,8 +2170,8 @@ class Builder(QWidget):
 
     def on_done(self, exe):
         self.build_btn.setEnabled(True); self.progress.setValue(100)
-        if self.cb_remember.isChecked():
-            BSETTINGS.setValue('last_config', self._collect_config()); BSETTINGS.sync()
+        self._remember_template()
+        BSETTINGS.sync()
         if getattr(self, '_last_fast', False):
             hint = ("文件夹·快速增量模式：桌宠已生成在下方文件夹。\n" + os.path.dirname(exe) +
                     "\n\n请运行其中的「" + os.path.basename(exe) + "」。\n"
